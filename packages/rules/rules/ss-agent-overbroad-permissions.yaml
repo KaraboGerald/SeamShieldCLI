@@ -1,0 +1,27 @@
+id: ss/agent/overbroad-permissions
+severity: warn
+title: Overbroad AI agent permission grant
+description: >
+  An agent settings file grants blanket permissions — wildcard Bash,
+  allow-everything, or bypassing the permission system entirely. One
+  prompt-injected instruction then runs with full machine access.
+framework_ref: AI_AGENT_DROP_IN.md#default-security-stance
+check:
+  type: regex
+  include:
+    basenames: ["settings.json", "settings.local.json"]
+    path_contains: [".claude"]
+  patterns:
+    - name: wildcard-bash-allow
+      regex: "\"Bash\\(\\*"
+    - name: bypass-permissions-mode
+      regex: "bypassPermissions|dangerously-skip-permissions"
+    - name: allow-everything
+      regex: "\"allow\"\\s*:\\s*\\[\\s*\"\\*\""
+fix:
+  summary: Replace blanket grants with specific allowed command patterns.
+  agent_prompt: >
+    Replace the wildcard grant with the specific commands the workflow
+    actually needs (for example "Bash(npm test:*)", "Bash(git status)").
+    Remove bypassPermissions/skip-permissions defaults so destructive
+    actions still prompt.

@@ -1,0 +1,22 @@
+id: ss/deps/unpinned-spec
+severity: info
+title: Dependency pinned to "latest" or "*"
+description: >
+  A dependency version of "latest" or "*" resolves to whatever the
+  registry serves at install time, making builds unreproducible and
+  auto-adopting compromised releases.
+framework_ref: AI_AGENT_DROP_IN.md#supply-chain-stance
+check:
+  type: regex
+  include:
+    basenames: ["package.json"]
+  patterns:
+    - name: latest-or-star-spec
+      regex: "\"\\s*:\\s*\"(?:\\*|latest)\""
+fix:
+  summary: Pin the dependency to a specific version or range.
+  agent_prompt: >
+    Replace the "latest" or "*" specifier with the currently installed
+    version (check the lockfile or node_modules/<pkg>/package.json) using a
+    caret range, for example "^2.4.1", then reinstall to update the
+    lockfile.

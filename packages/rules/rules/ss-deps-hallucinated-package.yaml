@@ -1,0 +1,16 @@
+id: ss/deps/hallucinated-package
+severity: block
+title: Dependency does not exist on npm
+description: >
+  AI agents sometimes invent package names. Installing a newly created or
+  squatted package with that name later can execute attacker-controlled code.
+framework_ref: AI_AGENT_DROP_IN.md#supply-chain-stance
+check:
+  type: builtin
+  builtin: hallucinated-package
+fix:
+  summary: Replace the dependency with a real maintained package or remove it.
+  agent_prompt: >
+    Verify the intended package name against npm and the project docs. Replace
+    this dependency with the maintained package that provides the needed API,
+    update imports, reinstall, and commit the updated lockfile.

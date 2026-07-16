@@ -1,0 +1,40 @@
+id: ss/agent/risky-filesystem-permissions
+severity: warn
+title: AI agent can modify secrets or broad filesystem paths
+description: >
+  An agent or tool configuration grants filesystem access to dotenv files,
+  secret directories, the repository root, home directories, or every path.
+  A prompt-injected edit can then read or rewrite credentials and policy files.
+framework_ref: AI_AGENT_DROP_IN.md#default-security-stance
+check:
+  type: regex
+  include:
+    basenames:
+      - ".mcp.json"
+      - "mcp.json"
+      - "claude_desktop_config.json"
+      - "settings.json"
+      - "settings.local.json"
+      - "skills-lock.json"
+      - "*.mdc"
+    path_contains:
+      - ".claude"
+      - ".cursor"
+      - ".agents"
+      - ".mcp"
+      - ".windsurf"
+      - ".clinerules"
+  patterns:
+    - name: dotenv-path-grant
+      regex: "\"(?:path|paths|allow|allowed|roots|directories|write|read)\"\\s*:\\s*(?:\\[[^\\]]*)?[\"'][^\"']*\\.env(?:\\.[^\"']*)?[\"']"
+    - name: broad-repo-path-grant
+      regex: "\"(?:path|paths|allow|allowed|roots|directories|write|read)\"\\s*:\\s*(?:\\[[^\\]]*)?[\"'](?:\\*\\*|/|~|\\$HOME|\\.\\.|\\./\\*\\*)[\"']"
+    - name: secret-directory-grant
+      regex: "\"(?:path|paths|allow|allowed|roots|directories|write|read)\"\\s*:\\s*(?:\\[[^\\]]*)?[\"'][^\"']*(?:\\.ssh|secrets?|credentials?)[^\"']*[\"']"
+fix:
+  summary: Restrict agent filesystem access to the narrow project files it needs.
+  agent_prompt: >
+    Replace the broad filesystem grant with explicit, non-secret project paths.
+    Do not allow agent tools to read or write `.env`, `.ssh`, credentials,
+    secret directories, home directories, parent directories, or wildcard roots
+    without an explicit human approval step.

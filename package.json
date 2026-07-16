@@ -1,0 +1,14 @@
+{
+  "name": "seamshield-cli-workspace",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "packageManager": "pnpm@11.6.0",
+  "scripts": {
+    "build": "pnpm --filter @seamshield/rules... run build && pnpm --filter @seamshield/core... run build && pnpm --filter @seamshield/cli run build",
+    "test": "pnpm run build && pnpm --filter @seamshield/core test && pnpm --filter @seamshield/cli test",
+    "release:verify": "pnpm run build && pnpm --filter @seamshield/cli test && pnpm --filter @seamshield/cli pack --dry-run"
+  }
+}

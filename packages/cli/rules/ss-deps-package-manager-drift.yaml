@@ -1,0 +1,17 @@
+id: ss/deps/package-manager-drift
+severity: warn
+title: Package manager and lockfile drift
+description: >
+  The project declares one package manager but has a different or competing
+  lockfile committed. Installs can resolve with a different tool than CI or the
+  developer machine, making dependency state drift across environments.
+framework_ref: AI_AGENT_DROP_IN.md#supply-chain-stance
+check:
+  type: builtin
+  builtin: package-manager-drift
+fix:
+  summary: Keep one package manager and one matching lockfile.
+  agent_prompt: >
+    Decide the intended package manager for this repo, remove stale lockfiles
+    from other managers, run the intended install command once, and commit the
+    resulting matching lockfile plus packageManager metadata if used.

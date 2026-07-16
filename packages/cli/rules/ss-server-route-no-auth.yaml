@@ -1,0 +1,21 @@
+id: ss/server/route-no-auth
+severity: warn
+title: Self-hosted server route with no recognizable auth middleware
+description: >
+  An Express, Fastify, or Hono route handler contains no recognizable auth,
+  signature, token, or public-route marker. Review whether this self-hosted
+  server endpoint should be callable by anyone.
+framework_ref: AI_AGENT_DROP_IN.md#default-security-stance
+check:
+  type: builtin
+  builtin: server-grouped-router-boundary
+  include:
+    extensions: [".ts", ".js", ".tsx", ".jsx", ".mjs"]
+    path_contains: ["server", "api", "routes"]
+fix:
+  summary: Add auth middleware or mark the route as intentionally public.
+  agent_prompt: >
+    Decide whether this server route should be public. If not, add auth,
+    API-key, session, or webhook-signature verification before the handler
+    does work. If it is intentionally public, add a short public-route
+    comment and a seamshield-ignore for this rule.

@@ -1,0 +1,41 @@
+id: ss/ai/public-provider-key
+severity: block
+title: AI provider key exposed through a public client variable
+description: >
+  A public/client environment variable is named like an AI provider API key.
+  Frameworks such as Next.js and Vite can inline these values into browser
+  bundles, giving visitors direct access to model spend and data paths.
+framework_ref: AI_AGENT_DROP_IN.md#default-security-stance
+check:
+  type: regex
+  redact: true
+  include:
+    extensions:
+      - ".ts"
+      - ".tsx"
+      - ".js"
+      - ".jsx"
+      - ".mjs"
+      - ".cjs"
+      - ".json"
+      - ".yaml"
+      - ".yml"
+      - ".toml"
+    basenames:
+      - ".env*"
+      - "Dockerfile"
+      - "docker-compose.yml"
+      - "docker-compose.yaml"
+      - "vercel.json"
+      - "netlify.toml"
+      - "coolify.yml"
+      - "coolify.yaml"
+  patterns:
+    - name: public-ai-provider-key
+      regex: "(?:NEXT_PUBLIC_|VITE_|PUBLIC_)[A-Z0-9_]*(?:OPENAI|ANTHROPIC|GOOGLE|GEMINI|MISTRAL|TOGETHER|GROQ|XAI|DEEPSEEK|PERPLEXITY|FIREWORKS|REPLICATE)[A-Z0-9_]*(?:API_KEY|TOKEN|SECRET|KEY)"
+fix:
+  summary: Move the AI provider key to a server-only environment variable.
+  agent_prompt: >
+    Remove the public/client prefix from this AI provider key and read it only
+    from server-only code. Route browser requests through an authenticated
+    server endpoint that enforces tenant, user, rate, and spending limits.

@@ -1,0 +1,16 @@
+id: ss/deps/known-vuln
+severity: high
+title: Dependency version has known vulnerabilities
+description: >
+  The pinned dependency version is reported by OSV for the npm ecosystem.
+  Known exploited vulnerability indicators are escalated to block severity.
+framework_ref: seamshield-final-framework/adoption-contract/.seamshield/release-gates.yaml
+check:
+  type: builtin
+  builtin: known-vuln
+fix:
+  summary: Upgrade the dependency to a non-vulnerable version and refresh the lockfile.
+  agent_prompt: >
+    Upgrade this dependency to the nearest non-vulnerable version that satisfies
+    the project, update the lockfile, run the affected tests, and document any
+    breaking API changes.

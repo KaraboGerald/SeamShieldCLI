@@ -1,0 +1,26 @@
+id: ss/convex/mutation-no-auth
+severity: warn
+title: Public Convex mutation with no auth check
+description: >
+  A public Convex mutation never consults ctx.auth. Public mutations are
+  callable by anyone who can reach the deployment URL — review whether this
+  one should verify the caller first.
+framework_ref: AI_AGENT_DROP_IN.md#default-security-stance
+check:
+  type: absence
+  include:
+    path_contains: ["convex/"]
+    extensions: [".ts", ".js"]
+  exclude:
+    dirs: ["_generated"]
+  file_contains: "(?<![A-Za-z])mutation\\s*\\("
+  patterns:
+    - name: convex-auth-markers
+      regex: "ctx\\.auth|getAuthUserId|getUserIdentity|requireAuth|requireInternalToken|getCaller|requireRole|requireAdmin|internalMutation|seamshield-public|publicIntent|publicMutation|allowAnonymous|rateLimit|rateLimiter|RATE_LIMITED|emailHash|hashKey|normalizeEmail|isValidEmail|waitlist_join"
+fix:
+  summary: Verify the caller with ctx.auth at the top of the mutation, or make it internal.
+  agent_prompt: >
+    Add an auth check at the top of this mutation — for example `const
+    identity = await ctx.auth.getUserIdentity(); if (!identity) throw new
+    Error("Unauthorized");` — or convert it to internalMutation if it
+    should only ever be called from other server functions.

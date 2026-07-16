@@ -1,0 +1,44 @@
+id: ss/ai/untrusted-model-base-url
+severity: warn
+title: AI SDK points at an unofficial model gateway
+description: >
+  Code or config routes model traffic through a non-provider base URL. That may
+  be intentional, but it changes custody for prompts, tool calls, outputs, and
+  provider credentials and should be reviewed before shipping.
+framework_ref: AI_AGENT_DROP_IN.md#default-security-stance
+check:
+  type: regex
+  include:
+    extensions:
+      - ".ts"
+      - ".tsx"
+      - ".js"
+      - ".jsx"
+      - ".mjs"
+      - ".cjs"
+      - ".json"
+      - ".yaml"
+      - ".yml"
+      - ".toml"
+      - ".py"
+    basenames:
+      - ".env*"
+      - "Dockerfile"
+      - "docker-compose.yml"
+      - "docker-compose.yaml"
+      - "vercel.json"
+      - "netlify.toml"
+      - "coolify.yml"
+      - "coolify.yaml"
+  patterns:
+    - name: provider-base-url-env
+      regex: "(?:OPENAI|ANTHROPIC|GOOGLE|GEMINI|MISTRAL|TOGETHER|GROQ|XAI|DEEPSEEK|PERPLEXITY|FIREWORKS|REPLICATE)[A-Z0-9_]*(?:BASE_URL|BASEURL|API_BASE)\\s*[:=]\\s*[\"']?https?://(?!(?:api\\.openai\\.com|api\\.anthropic\\.com|generativelanguage\\.googleapis\\.com|api\\.mistral\\.ai|api\\.together\\.xyz|api\\.groq\\.com|api\\.x\\.ai|api\\.deepseek\\.com|api\\.perplexity\\.ai|api\\.fireworks\\.ai|api\\.replicate\\.com)(?:/|[\"']|\\s|$))[^\"'\\s]+"
+    - name: sdk-base-url-option
+      regex: "(?:baseURL|base_url|apiBase|api_base)\\s*[:=]\\s*[\"']https?://(?!(?:api\\.openai\\.com|api\\.anthropic\\.com|generativelanguage\\.googleapis\\.com|api\\.mistral\\.ai|api\\.together\\.xyz|api\\.groq\\.com|api\\.x\\.ai|api\\.deepseek\\.com|api\\.perplexity\\.ai|api\\.fireworks\\.ai|api\\.replicate\\.com)(?:/|[\"']|\\s|$))[^\"'\\s]+[\"']"
+fix:
+  summary: Verify the model gateway custody boundary or use the official provider endpoint.
+  agent_prompt: >
+    Confirm whether this gateway is approved for prompts, model outputs, tool
+    calls, and provider credentials. If it is not approved, remove the custom
+    base URL and use the official provider endpoint. Do not paste prompts,
+    credentials, or model outputs into a fix plan.

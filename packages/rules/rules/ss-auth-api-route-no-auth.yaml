@@ -1,0 +1,26 @@
+id: ss/auth/api-route-no-auth
+severity: warn
+title: API route with no recognizable auth or signature check
+description: >
+  An API route handler contains no recognizable authentication,
+  authorization, or webhook-signature marker. Review whether this endpoint
+  should really be callable by anyone on the internet.
+framework_ref: AI_AGENT_DROP_IN.md#default-security-stance
+check:
+  type: absence
+  include:
+    path_contains: ["/api/"]
+    extensions: [".ts", ".js", ".tsx", ".jsx"]
+  exclude:
+    basenames: ["_*.ts", "_*.js", "_*.tsx", "_*.jsx"]
+  patterns:
+    - name: auth-or-signature-markers
+      regex: "auth|Auth|session|Session|currentUser|getUser|clerk|Clerk|jwt|JWT|cookie|Cookie|bearer|Bearer|signature|webhook|svix|x-api-key|apiKey|API_KEY|verif|rate[Ll]imit|public|410|Gone"
+fix:
+  summary: Authenticate the caller, or mark the route as intentionally public.
+  agent_prompt: >
+    Decide whether this API route should be public. If not, validate the
+    caller's session or API key at the top of the handler and return 401
+    before doing any work. If it is intentionally public (a health check,
+    a webhook with signature verification elsewhere), add a short comment
+    saying so and a seamshield-ignore for this rule.

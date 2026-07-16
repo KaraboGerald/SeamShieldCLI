@@ -1,0 +1,21 @@
+id: ss/server/webhook-missing-signature
+severity: high
+title: Webhook route has no recognizable signature verification
+description: >
+  A public webhook endpoint can trigger handler work without a recognizable
+  signature verification step. Verify the provider signature before parsing or
+  acting on the event.
+framework_ref: AI_AGENT_DROP_IN.md#default-security-stance
+check:
+  type: builtin
+  builtin: webhook-signature-boundary
+  include:
+    extensions: [".ts", ".js", ".tsx", ".jsx", ".mjs"]
+    path_contains: ["server", "api", "routes"]
+fix:
+  summary: Verify the provider signature before processing the webhook event.
+  agent_prompt: >
+    Add provider-supported webhook signature verification before parsing or
+    executing the handler. Preserve the raw request body if the provider
+    requires it. Do not replace verification with a client-controlled header
+    or disable it to make tests pass.

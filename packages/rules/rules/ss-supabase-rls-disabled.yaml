@@ -1,0 +1,22 @@
+id: ss/supabase/rls-disabled
+severity: block
+title: Row Level Security disabled on a table
+description: >
+  A SQL migration disables Row Level Security. On Supabase the anon key is
+  public by design — RLS is the only thing standing between the internet
+  and this table's rows.
+framework_ref: AI_AGENT_DROP_IN.md#default-security-stance
+check:
+  type: regex
+  include:
+    extensions: [".sql"]
+  patterns:
+    - name: rls-disabled
+      regex: "(?:DISABLE ROW LEVEL SECURITY|disable row level security)"
+fix:
+  summary: Re-enable RLS and write policies for the access the app actually needs.
+  agent_prompt: >
+    Change this statement to ENABLE ROW LEVEL SECURITY and add explicit
+    CREATE POLICY statements for each access pattern the app needs (for
+    example: users can select/update their own rows). If RLS was disabled
+    to debug a policy, fix the policy instead of removing the protection.

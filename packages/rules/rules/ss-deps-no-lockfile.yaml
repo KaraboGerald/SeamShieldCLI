@@ -1,0 +1,17 @@
+id: ss/deps/no-lockfile
+severity: warn
+title: package.json with no lockfile
+description: >
+  No lockfile sits next to package.json, so every install re-resolves
+  dependency versions. Builds are not reproducible, and a hijacked patch
+  release of any dependency lands silently on the next install.
+framework_ref: AI_AGENT_DROP_IN.md#supply-chain-stance
+check:
+  type: builtin
+  builtin: no-lockfile
+fix:
+  summary: Commit a lockfile (pnpm-lock.yaml, package-lock.json, or yarn.lock).
+  agent_prompt: >
+    Run the project's package manager install once (npm install / pnpm
+    install / yarn) and commit the generated lockfile. Make sure .gitignore
+    does not exclude it.

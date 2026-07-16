@@ -1,0 +1,24 @@
+id: ss/auth/client-only-guard
+severity: warn
+title: Auth guard that only runs in the browser
+description: >
+  A "use client" component gates content behind a client-side user check.
+  Client-side guards are cosmetic — the data behind them must also be
+  protected on the server, or anyone can fetch it directly.
+framework_ref: AI_AGENT_DROP_IN.md#default-security-stance
+check:
+  type: regex
+  include:
+    extensions: [".ts", ".tsx", ".js", ".jsx"]
+  file_contains: "[\"']use client[\"']"
+  patterns:
+    - name: client-side-auth-gate
+      regex: "if\\s*\\(\\s*!\\s*(?:user|session|currentUser|isAuthenticated|isLoggedIn|loggedIn|signedIn|isSignedIn)\\b"
+fix:
+  summary: Keep the UX guard, but enforce the same check server-side where the data is fetched.
+  agent_prompt: >
+    Keep this client-side check for UX, but verify that every piece of data
+    this component renders is also protected server-side — in the route
+    handler, server component, or database policy that produces it. If the
+    server already enforces it, suppress this finding with a
+    seamshield-ignore comment.

@@ -1,0 +1,22 @@
+id: ss/supabase/permissive-policy
+severity: high
+title: RLS policy that allows everything
+description: >
+  A policy with USING (true) or WITH CHECK (true) grants the operation to
+  every requester, including the public anon role. RLS is technically on,
+  but it protects nothing.
+framework_ref: AI_AGENT_DROP_IN.md#default-security-stance
+check:
+  type: regex
+  include:
+    extensions: [".sql"]
+  patterns:
+    - name: policy-always-true
+      regex: "(?:USING|using|WITH CHECK|with check)\\s*\\(\\s*(?:true|TRUE)\\s*\\)"
+fix:
+  summary: Scope the policy to the requesting user (for example auth.uid() = user_id).
+  agent_prompt: >
+    Rewrite this policy condition to scope access to the requesting user —
+    typically `auth.uid() = user_id` for ownership, or a role check for
+    shared data. If the table is genuinely public read-only, restrict the
+    policy to SELECT and add a comment explaining why.

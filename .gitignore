@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.pnpm-store/
+.DS_Store
+coverage/
+.agents/
+skills-lock.json
+*.tgz
+.seamshield/
+*.env
+!.env.example
+!examples/vulnerable-next-app/.env

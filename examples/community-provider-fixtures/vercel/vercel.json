@@ -1,0 +1,4 @@
+{
+  "headers": [{ "source": "/api/(.*)", "headers": [{ "key": "Access-Control-Allow-Origin", "value": "*" }] }],
+  "rewrites": [{ "source": "/admin/:path*", "destination": "/api/admin/:path*" }]
+}

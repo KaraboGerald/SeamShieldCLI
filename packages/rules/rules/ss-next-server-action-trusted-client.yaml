@@ -1,0 +1,19 @@
+id: ss/next/server-action-trusted-client
+severity: warn
+title: Server action trusts role, tenant, org, or user id from client input
+description: >
+  A Next.js server action uses role, tenant, org, team, workspace, account, or
+  user id values from form data, request body, args, or payload without a
+  recognized server-side auth or membership check.
+framework_ref: OPEN_CORE.md#oss-scanner-boundary
+check:
+  type: builtin
+  builtin: next-server-action-trusted-client
+fix:
+  summary: Derive caller identity and authorization server-side before privileged server action work.
+  agent_prompt: >
+    Review this server action as an access boundary. Do not trust role, user id,
+    tenant id, org id, team id, workspace id, or account id from FormData,
+    request JSON, args, or client state. Load the authenticated caller
+    server-side, verify role or membership there, and ignore client-controlled
+    authorization fields except as lookup candidates after membership proof.

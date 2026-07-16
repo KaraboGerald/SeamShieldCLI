@@ -1,0 +1,24 @@
+id: ss/auth/admin-route-unprotected
+severity: high
+title: Admin route with no recognizable auth check
+description: >
+  A page or route under an /admin/ path contains no recognizable
+  authentication or authorization marker. If a parent layout or middleware
+  guards it, suppress this with a seamshield-ignore comment; otherwise the
+  admin surface is open to anyone with the URL.
+framework_ref: AI_AGENT_DROP_IN.md#default-security-stance
+check:
+  type: absence
+  include:
+    path_contains: ["app/admin", "pages/admin"]
+    extensions: [".ts", ".tsx", ".js", ".jsx"]
+  patterns:
+    - name: auth-markers
+      regex: "auth|Auth|session|Session|currentUser|getUser|redirect|signIn|login|Login|clerk|Clerk|verif|jwt|JWT|cookie|Cookie|middleware"
+fix:
+  summary: Add a server-side auth + role check before rendering admin content.
+  agent_prompt: >
+    Add a server-side authentication and role check at the top of this
+    admin page or its layout — for example, load the session, verify the
+    user has an admin role, and redirect to the login page otherwise. A
+    client-side check is not sufficient; the check must run on the server.

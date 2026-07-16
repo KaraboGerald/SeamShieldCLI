@@ -1,0 +1,20 @@
+id: ss/convex/public-function-no-auth
+severity: warn
+title: Public Convex function with sensitive capability and no auth check
+description: >
+  A public Convex query, mutation, or action touches sensitive server capability
+  such as database writes, privileged tenant/team paths, secrets, or admin-like
+  operations without a recognized auth or internal-only guard.
+framework_ref: OPEN_CORE.md#oss-scanner-boundary
+check:
+  type: builtin
+  builtin: convex-public-function-no-auth
+fix:
+  summary: Add a server-side auth/role guard, mark the function internal, or explicitly document safe public intent.
+  agent_prompt: >
+    Review this Convex function as a public entrypoint. If it changes data,
+    accesses tenant/team/admin state, or reads privileged runtime capability,
+    add ctx.auth/getAuthUserId plus the required role or tenant check near the
+    top. If it is server-only, convert it to internalQuery/internalMutation/
+    internalAction. If it is intentionally public and low risk, add an explicit
+    public-intent marker and rate limit instead of weakening auth checks.

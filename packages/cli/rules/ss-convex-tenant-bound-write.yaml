@@ -1,0 +1,19 @@
+id: ss/convex/tenant-bound-write
+severity: warn
+title: Convex write trusts caller-provided tenant or org id
+description: >
+  A public Convex function writes tenant, org, team, workspace, or account
+  scoped data using an id from args without recognized server-side membership
+  proof. Client-provided tenancy is not authorization.
+framework_ref: OPEN_CORE.md#oss-scanner-boundary
+check:
+  type: builtin
+  builtin: convex-tenant-bound-write
+fix:
+  summary: Prove membership server-side before using caller-provided tenant or org ids in writes.
+  agent_prompt: >
+    Review this Convex function as a public tenant boundary. Load the caller
+    identity with ctx.auth/getAuthUserId, verify membership or role for the
+    supplied tenant/org/team/workspace id on the server, then perform the
+    write. Do not trust args.tenantId, args.orgId, args.teamId, or similar
+    client-controlled ids by themselves.

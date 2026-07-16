@@ -1,0 +1,30 @@
+{
+  "name": "@seamshield/rules",
+  "version": "0.1.0",
+  "description": "SeamShield rule pack: YAML security rules for AI-generated codebases",
+  "type": "module",
+  "types": "./dist/index.d.ts",
+  "license": "MIT",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "rules",
+    "schemas"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsup src/index.ts --format esm --clean && tsc -p tsconfig.json --emitDeclarationOnly --declaration --declarationMap false --noEmit false"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsup": "^8.3.0",
+    "typescript": "^5.7.0"
+  }
+}

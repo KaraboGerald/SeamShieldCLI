@@ -1,0 +1,23 @@
+id: ss/client/firebase-admin-in-client
+severity: block
+title: firebase-admin imported in a client component
+description: >
+  firebase-admin is the server-side SDK that bypasses all Firebase security
+  rules. Importing it in a "use client" file either breaks the build or, far
+  worse, bundles admin credentials into the browser bundle.
+framework_ref: AI_AGENT_DROP_IN.md#framework-compromise-rule
+check:
+  type: regex
+  include:
+    extensions: [".ts", ".tsx", ".js", ".jsx", ".mjs"]
+  file_contains: "[\"']use client[\"']"
+  patterns:
+    - name: firebase-admin-import
+      regex: "(?:from\\s+[\"']firebase-admin|require\\([\"']firebase-admin)"
+fix:
+  summary: Move firebase-admin usage into server-only code; clients use the regular firebase SDK.
+  agent_prompt: >
+    Remove the firebase-admin import from this client component. Move the
+    admin operation into a server route handler or server action, expose
+    only the minimal result to the client, and use the regular `firebase`
+    client SDK (gated by security rules) for client-side reads.

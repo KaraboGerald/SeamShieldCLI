@@ -1,0 +1,19 @@
+id: ss/vercel/config-access-risk
+severity: high
+title: Vercel config opens a risky access lane
+description: >
+  vercel.json exposes a public/client secret, wildcard credentialed CORS, or a
+  privileged route through rewrites, routes, redirects, or cron paths without an
+  obvious auth/protection signal.
+framework_ref: OPEN_CORE.md#oss-scanner-boundary
+check:
+  type: builtin
+  builtin: vercel-config
+fix:
+  summary: Move secrets to server-only env, restrict public headers, and protect privileged Vercel routes.
+  agent_prompt: >
+    Inspect vercel.json and close the risky access lane. Do not place secrets in
+    NEXT_PUBLIC_, VITE_, or PUBLIC_ variables. Avoid wildcard credentialed CORS.
+    For admin/internal/debug/ops routes, require middleware, authorization
+    headers, or Vercel protection before the route can be reached from the
+    public internet.

@@ -1,0 +1,22 @@
+id: ss/deps/postinstall-script
+severity: warn
+title: Dependency install lifecycle script can execute shell commands
+description: >
+  npm lifecycle scripts such as postinstall run during dependency
+  installation. In AI-built apps this creates a supply-chain lane from a
+  dependency or pasted package.json change into local shell execution.
+framework_ref: AI_AGENT_DROP_IN.md#supply-chain-stance
+check:
+  type: regex
+  include:
+    basenames: ["package.json"]
+  patterns:
+    - name: install-lifecycle-script
+      regex: "\"(?:preinstall|install|postinstall)\"\\s*:"
+fix:
+  summary: Remove install lifecycle scripts unless they are reviewed and required.
+  agent_prompt: >
+    Review why this install lifecycle script is needed. If it is not
+    required, remove it. If it is required, pin the dependency or script
+    owner, document the command, and make sure it cannot download or execute
+    unreviewed remote code.

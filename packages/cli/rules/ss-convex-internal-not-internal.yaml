@@ -1,0 +1,25 @@
+id: ss/convex/internal-not-internal
+severity: warn
+title: Function named internal* but exported as public
+description: >
+  A Convex function whose name starts with "internal" is declared with the
+  public mutation/query/action constructor. The name says private, the
+  declaration says public — anyone can call it.
+framework_ref: AI_AGENT_DROP_IN.md#default-security-stance
+check:
+  type: regex
+  include:
+    path_contains: ["convex/"]
+    extensions: [".ts", ".js"]
+  exclude:
+    dirs: ["_generated"]
+  patterns:
+    - name: internal-named-public-fn
+      regex: "const\\s+internal[A-Z]\\w*\\s*=\\s*(?:mutation|query|action)\\s*\\("
+fix:
+  summary: Declare it with internalMutation/internalQuery/internalAction instead.
+  agent_prompt: >
+    Change this declaration to the internal variant (internalMutation,
+    internalQuery, or internalAction from ./_generated/server) so it can
+    only be invoked by other Convex functions, and update any client-side
+    callers — they should not exist if the name is accurate.

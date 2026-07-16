@@ -1,0 +1,63 @@
+{
+  "name": "@seamshield/cli",
+  "version": "0.3.22",
+  "description": "Community access-lane scanner and local control engine for AI-built apps",
+  "type": "module",
+  "license": "MIT",
+  "homepage": "https://seamshield.com",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/KaraboGerald/SeamShieldCLI.git",
+    "directory": "packages/cli"
+  },
+  "bugs": {
+    "url": "https://github.com/KaraboGerald/SeamShieldCLI/issues"
+  },
+  "keywords": [
+    "security",
+    "scanner",
+    "cli",
+    "ai",
+    "vibecoding",
+    "secrets",
+    "sast",
+    "nextjs",
+    "supabase",
+    "firebase",
+    "convex",
+    "vercel",
+    "coolify",
+    "claude-code",
+    "cursor",
+    "osv",
+    "sarif"
+  ],
+  "bin": {
+    "seamshield": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "rules",
+    "schemas"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsup src/index.ts --format esm --clean && tsc -p tsconfig.build.json && node scripts/copy-assets.mjs",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "commander": "^14.0.0",
+    "yaml": "^2.5.0",
+    "zod": "^4.0.0"
+  },
+  "devDependencies": {
+    "@seamshield/core": "workspace:*",
+    "@seamshield/rules": "workspace:*",
+    "@types/node": "^22.0.0",
+    "tsup": "^8.3.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0"
+  }
+}

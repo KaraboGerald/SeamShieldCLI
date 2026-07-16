@@ -1,0 +1,22 @@
+id: ss/firebase/open-rules
+severity: block
+title: Firebase security rules allow unrestricted access
+description: >
+  A Firebase rules file grants read or write with "if true". Every
+  document or object it covers is readable or writable by anyone on the
+  internet, no authentication required.
+framework_ref: AI_AGENT_DROP_IN.md#default-security-stance
+check:
+  type: regex
+  include:
+    basenames: ["*.rules"]
+  patterns:
+    - name: allow-if-true
+      regex: "allow\\s+[a-z, ]+:\\s*if\\s+true"
+fix:
+  summary: Require auth and ownership in the rule condition.
+  agent_prompt: >
+    Replace `if true` with a real condition — at minimum `if request.auth
+    != null`, and for user data `if request.auth.uid == resource.data.
+    ownerId` (or the equivalent path check). Deploy the updated rules and
+    verify access with the Firebase rules simulator.

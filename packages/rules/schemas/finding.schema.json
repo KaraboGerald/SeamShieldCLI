@@ -1,0 +1,92 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://seamshield.dev/schemas/finding.schema.json",
+  "title": "SeamShield Scan Finding",
+  "description": "Profile of seamshield-final-framework canonical-security-ir for scanner findings, extended with a `finding` object. Spine fields keep canonical IR semantics.",
+  "type": "object",
+  "required": [
+    "event_id",
+    "event_type",
+    "time",
+    "tenant",
+    "decision",
+    "route",
+    "engines",
+    "provenance",
+    "spans",
+    "finding"
+  ],
+  "properties": {
+    "event_id": { "type": "string", "minLength": 8 },
+    "event_type": { "const": "scan.finding" },
+    "time": { "type": "string", "format": "date-time" },
+    "tenant": { "type": "string" },
+    "decision": { "enum": ["deny", "scan"] },
+    "route": {
+      "type": "object",
+      "required": ["plane", "lane", "reason"],
+      "properties": {
+        "plane": { "const": "evidence" },
+        "lane": { "const": "cpu" },
+        "reason": {
+          "type": "array",
+          "items": { "type": "string" },
+          "minItems": 1
+        }
+      }
+    },
+    "engines": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["name", "version"],
+        "properties": {
+          "name": { "type": "string" },
+          "version": { "type": "string" },
+          "role": { "type": "string" }
+        }
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "required": ["policy_bundle_digest"],
+      "properties": {
+        "policy_bundle_digest": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+      }
+    },
+    "spans": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["start", "end", "label", "evidence"],
+        "properties": {
+          "start": { "type": "integer", "minimum": 1 },
+          "end": { "type": "integer", "minimum": 1 },
+          "label": { "type": "string" },
+          "evidence": { "type": "string" }
+        }
+      }
+    },
+    "finding": {
+      "type": "object",
+      "required": ["rule_id", "severity", "title", "file", "line", "fix"],
+      "properties": {
+        "rule_id": { "type": "string", "pattern": "^ss/[a-z-]+/[a-z0-9-]+$" },
+        "severity": { "enum": ["block", "high", "warn", "info"] },
+        "title": { "type": "string" },
+        "file": { "type": "string" },
+        "line": { "type": "integer", "minimum": 1 },
+        "fix": {
+          "type": "object",
+          "required": ["summary", "agent_prompt"],
+          "properties": {
+            "summary": { "type": "string" },
+            "agent_prompt": { "type": "string" },
+            "doc_url": { "type": "string" }
+          }
+        }
+      }
+    }
+  }
+}
