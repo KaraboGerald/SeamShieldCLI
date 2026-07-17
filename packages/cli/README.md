@@ -1,7 +1,6 @@
 # SeamShield
 
-Community local access-lane scanner/control engine for AI-built JavaScript and
-TypeScript apps.
+Community local access-lane scanner/control engine for AI-built repositories.
 
 SeamShield maps who or what can reach sensitive assets before you ship:
 `Actor -> Lane -> Asset -> Permission -> Condition -> Risk`.
@@ -27,6 +26,20 @@ seamshield ship .
 ```
 
 Requires Node.js 20 or newer.
+
+## Repository Coverage
+
+SeamShield runs baseline local controls on every repository, regardless of the
+language an AI IDE used to create it. Baseline coverage includes repository-wide
+credential controls, AI-agent and MCP configuration checks, deployment metadata,
+and JSON, SARIF, and NDJSON evidence output.
+
+`seamshield inventory .` and `seamshield status .` detect repository markers
+for JavaScript/TypeScript, Python, Go, Java, .NET, Ruby, PHP, and Rust. They
+report the deeper access-lane adapters that actually ran. Framework-specific
+analysis is currently deepest for Next.js, Convex, and generic Node servers.
+An unfamiliar language remains protected by baseline controls; SeamShield does
+not invent routes, authorization findings, or coverage it has not verified.
 
 ## Commands
 

@@ -1,6 +1,6 @@
 # SeamShield Community CLI
 
-The local-first, open-source access-lane scanner for AI-built applications.
+The local-first, open-source access-lane scanner for AI-built repositories.
 
 ```bash
 npx @seamshield/cli init .
@@ -8,6 +8,10 @@ npx @seamshield/cli ship .
 ```
 
 The CLI maps `Actor -> Lane -> Asset -> Permission -> Condition`, writes local fix plans, and does not upload source code. The commercial Platform, Console, runtime services, customer data, and infrastructure are intentionally not part of this repository.
+
+SeamShield applies baseline local controls to every repository and reports the
+language and framework adapters it actually detects. It does not claim equal
+semantic access-lane coverage across every ecosystem.
 
 ## Repository layout
 

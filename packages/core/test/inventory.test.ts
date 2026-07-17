@@ -57,4 +57,20 @@ describe("read-only inventory", () => {
     expect(lines[0]).toEqual(expect.objectContaining({ record_type: "inventory_component" }));
     expect(lines.at(-1)).toEqual(expect.objectContaining({ record_type: "inventory_summary" }));
   });
+
+  it("reports capability depth for non-JavaScript repository markers without inventing adapters", () => {
+    const dir = makeTempDir("seamshield-inventory-capabilities-");
+    writeFileSync(join(dir, "pyproject.toml"), "[project]\nname = 'example'\n");
+    writeFileSync(join(dir, "go.mod"), "module example.com/service\n");
+    writeFileSync(join(dir, "pom.xml"), "<project />\n");
+    writeFileSync(join(dir, "service.csproj"), "<Project />\n");
+
+    const inventory = collectInventory(dir);
+    const languages = inventory.capabilities.languages.map((language) => language.id);
+
+    expect(languages).toEqual(expect.arrayContaining(["python", "go", "java", "dotnet"]));
+    expect(inventory.capabilities.coverage.deep_access_lane_adapters).toEqual([]);
+    expect(inventory.capabilities.coverage.unknown_language_policy).toBe("baseline_only");
+    expect(JSON.stringify(inventory.capabilities)).not.toContain("example.com");
+  });
 });

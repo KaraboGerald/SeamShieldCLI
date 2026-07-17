@@ -68,6 +68,9 @@ describe("seamshield scan (built CLI)", () => {
     const status = runCli(["status", dir, "--format", "json"]);
     expect(status.status).toBe(0);
     expect(JSON.parse(status.stdout).next).toContain("seamshield init");
+    expect(JSON.parse(status.stdout).capabilities).toEqual(expect.objectContaining({
+      schema: "seamshield.repository-capabilities/v1",
+    }));
     const handoff = join(dir, "handoff.json");
     const exported = runCli(["offline", "export", dir, "--out", handoff]);
     expect(exported.status).toBe(0);
@@ -524,6 +527,9 @@ describe("seamshield scan (built CLI)", () => {
     expect(source).toContain("absolute local path excluded");
     expect(source).toContain('DEFAULT_CONNECTED_API_URL = "https://platform.seamshield.com/api"');
     expect(source).toContain("Persistent enrollment:");
+    expect(source).toContain("CI workflow created locally:");
+    expect(source).toContain("Next approval: commit and push .github/workflows/seamshield.yml");
+    expect(source).toContain("No GitHub token, repository secret, or long-lived CI key is required.");
     expect(source).toContain("requireReceiptDigest");
     expect(source).toContain("The local connection was left unchanged.");
     expect(source).toContain("Generate a fresh connection command in Build → Platform");
@@ -531,6 +537,8 @@ describe("seamshield scan (built CLI)", () => {
     expect(source).toContain(".seamshield/connection.json");
     expect(source).toContain("SEAMSHIELD_SERVER_KEY");
     expect(source).toContain("ACTIONS_ID_TOKEN_REQUEST_URL");
+    expect(source).toContain("enrollment key stored from the protected process environment");
+    expect(source).toContain("SEAMSHIELD_SENTINEL_KEY=${shellQuote(suppliedSentinelKey)}");
     expect(source).toContain("BITBUCKET_STEP_OIDC_TOKEN");
     expect(source).toContain("CIRCLE_OIDC_TOKEN_V2");
     expect(source).toContain("ci/exchange");

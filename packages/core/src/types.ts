@@ -228,7 +228,14 @@ export interface InventoryComponent {
     | "mcp"
     | "agent-skill"
     | "editor-extension"
-    | "deploy";
+    | "deploy"
+    | "pypi"
+    | "go"
+    | "maven"
+    | "nuget"
+    | "rubygems"
+    | "composer"
+    | "cargo";
   name: string;
   version?: string;
   source_type: string;
@@ -238,12 +245,31 @@ export interface InventoryComponent {
   confidence: InventoryConfidence;
 }
 
+export interface RepositoryCapability {
+  id: string;
+  confidence: InventoryConfidence;
+  signals: string[];
+}
+
+export interface RepositoryCapabilities {
+  schema: "seamshield.repository-capabilities/v1";
+  languages: RepositoryCapability[];
+  frameworks: RepositoryCapability[];
+  coverage: {
+    baseline: string[];
+    deep_access_lane_adapters: string[];
+    dependency_ecosystems: string[];
+    unknown_language_policy: "baseline_only";
+  };
+}
+
 export interface InventoryResult {
   schema: "seamshield.inventory/v1";
   target: string;
   profile: ScanProfile;
   generated_at: string;
   components: InventoryComponent[];
+  capabilities: RepositoryCapabilities;
   summary: {
     components_total: number;
     by_ecosystem: Record<string, number>;

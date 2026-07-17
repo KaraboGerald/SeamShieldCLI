@@ -8,6 +8,7 @@ export {
 } from "./access.js";
 export { buildFinding, isSuppressed, runRegexRule } from "./engine.js";
 export { checkConvexPublicFunctions, checkConvexTenantBoundWrites } from "./convexAdapter.js";
+export { detectRepositoryCapabilities } from "./capabilities.js";
 export { checkEnvFileCommitted } from "./envFileCommitted.js";
 export { buildFixPlan, writeFixPlan, writeMarkdownFixPlan, type FixPlanAgent } from "./fixPlan.js";
 export {

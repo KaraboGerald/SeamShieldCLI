@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { basename, resolve } from "node:path";
 import { stableId } from "./ids.js";
+import { detectRepositoryCapabilities } from "./capabilities.js";
 import type {
   InventoryComponent,
   InventoryConfidence,
@@ -195,7 +196,8 @@ function dedupe(components: InventoryComponent[]): InventoryComponent[] {
 export function collectInventory(target: string, options: { profile?: ScanProfile } = {}): InventoryResult {
   const root = resolve(target);
   const components: InventoryComponent[] = [];
-  for (const file of walk(root)) {
+  const files = walk(root);
+  for (const file of files) {
     if (basename(file.rel) === "package.json") components.push(...packageManifestComponents(file.abs, file.rel));
     const lock = lockfileComponent(file.rel);
     if (lock) components.push(lock);
@@ -220,6 +222,7 @@ export function collectInventory(target: string, options: { profile?: ScanProfil
     profile: options.profile ?? "community",
     generated_at: new Date().toISOString(),
     components: unique,
+    capabilities: detectRepositoryCapabilities(files),
     summary: {
       components_total: unique.length,
       by_ecosystem: countBy(unique, (component) => component.ecosystem),
@@ -239,6 +242,8 @@ export function renderInventoryTable(inventory: InventoryResult): string {
     `Target: ${inventory.target}`,
     `Profile: ${inventory.profile}`,
     `Components: ${inventory.summary.components_total}`,
+    `Languages: ${inventory.capabilities.languages.map((language) => language.id).join(", ") || "not detected"}`,
+    `Deep access-lane adapters: ${inventory.capabilities.coverage.deep_access_lane_adapters.join(", ") || "none detected · baseline coverage remains active"}`,
     "",
   ];
   for (const component of inventory.components) {
@@ -273,6 +278,7 @@ export function renderInventoryNdjson(inventory: InventoryResult): string {
       components_total: inventory.summary.components_total,
       by_ecosystem: inventory.summary.by_ecosystem,
       by_confidence: inventory.summary.by_confidence,
+      capabilities: inventory.capabilities,
     }),
   );
   return `${lines.join("\n")}\n`;

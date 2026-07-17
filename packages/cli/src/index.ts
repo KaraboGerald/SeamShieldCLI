@@ -924,6 +924,7 @@ function installSentinelSchedule(target: string): number {
   const envPath = join(configDir, "sentinel.env");
   const runnerPath = join(configDir, "run");
   const unit = `seamshield-sentinel-${safeId}`;
+  const suppliedSentinelKey = String(process.env.SEAMSHIELD_SENTINEL_KEY || "").trim();
   mkdirSync(configDir, { recursive: true });
   mkdirSync(systemdDir, { recursive: true });
   if (!existsSync(envPath)) {
@@ -936,6 +937,15 @@ function installSentinelSchedule(target: string): number {
       "CLOUDFLARE_API_TOKEN=",
       "",
     ].join("\n"), { mode: 0o600 });
+    chmodSync(envPath, 0o600);
+  }
+  if (suppliedSentinelKey) {
+    const current = readFileSync(envPath, "utf8");
+    const keyLine = `SEAMSHIELD_SENTINEL_KEY=${shellQuote(suppliedSentinelKey)}`;
+    const next = /^SEAMSHIELD_SENTINEL_KEY=.*$/m.test(current)
+      ? current.replace(/^SEAMSHIELD_SENTINEL_KEY=.*$/m, keyLine)
+      : `${current.trimEnd()}\n${keyLine}\n`;
+    writeFileSync(envPath, next, { mode: 0o600 });
     chmodSync(envPath, 0o600);
   }
   writeFileSync(runnerPath, [
@@ -960,7 +970,7 @@ function installSentinelSchedule(target: string): number {
   }
   console.log(`Sentinel schedule installed · ${unit}.timer`);
   console.log(`Every 15 minutes · server observation${existsSync(envPath) ? " · optional Cloudflare observation when CLOUDFLARE_API_TOKEN is set" : ""}`);
-  console.log(`Secret file: ${envPath} (mode 0600) · source upload: false`);
+  console.log(`Secret file: ${envPath} (mode 0600) · ${suppliedSentinelKey ? "enrollment key stored from the protected process environment" : "set SEAMSHIELD_SENTINEL_KEY before the first run"} · source upload: false`);
   return 0;
 }
 
@@ -1135,6 +1145,20 @@ function installCiAutomation(target: string, automation: CiAutomation, plan: CiP
   else if (plan.provider === "circleci") writeCircleConfig(target, automation);
   else writeGenericCiScript(target, automation);
   return { provider: plan.provider, repository: plan.repository, status: "configured" };
+}
+
+function printCiActivationGuide(plan: CiPlan, ci?: LocalConnection["ci"]): void {
+  if (!ci || ci.status !== "configured") return;
+  const workflow = plan.binding?.workflow_ref || "provider-native workflow";
+  console.log(`CI workflow created locally: ${workflow}`);
+  if (ci.provider === "github") {
+    console.log("Next approval: commit and push .github/workflows/seamshield.yml to your default branch.");
+    console.log("GitHub Actions then runs SeamShield on pull requests and pushes to main; the first signed OIDC receipt activates continuous protection.");
+    console.log("No GitHub token, repository secret, or long-lived CI key is required.");
+    return;
+  }
+  console.log(`Commit and push ${workflow}; the first provider OIDC receipt activates continuous protection.`);
+  console.log("No long-lived SeamShield CI key is written to the repository.");
 }
 
 type SecurityAgentJob = {
@@ -1373,6 +1397,7 @@ async function connectProject(target: string, options: { projectId?: string; tok
     writeLocalConnection(target, local);
     console.log(`Persistent enrollment: ${connectionPath(target)} (git ignored · mode 0600)`);
     console.log(`CI: ${local.ci?.status === "configured" ? `${local.ci.provider} OIDC configured for ${local.ci.repository}` : local.ci?.reason || "local sync remains active"}`);
+    printCiActivationGuide(ciPlan || buildCiPlan(target, options), local.ci);
     return result.exitCode === 0 ? 0 : result.exitCode;
   }
   let automationToken = "";
@@ -1834,15 +1859,21 @@ function buildStatusReport(target: string) {
   const root = resolve(target);
   const connection = readLocalConnection(root);
   const configPath = join(root, ".seamshield", "config.yaml");
-  const next = connection
-    ? "Connection is persistent. `seamshield sync .` refreshes Build, Guard, Fix Plans, Test Plans, Learn, and Console; CI does this automatically on push or merge."
+  const capabilities = collectInventory(root, { profile: "community" }).capabilities;
+  const next = connection?.ci?.status === "configured" && connection.ci.provider === "github"
+    ? "Ensure .github/workflows/seamshield.yml is committed and pushed. GitHub Actions then refreshes Build, Guard, Fix Plans, Test Plans, Learn, and Console on push or merge."
+    : connection
+      ? "Connection is persistent. `seamshield sync .` refreshes Build, Guard, Fix Plans, Test Plans, Learn, and Console; CI does this automatically after its provider workflow is committed and verified."
     : "Run `seamshield init .`, then generate a project connection command in the customer Console.";
-  return { schema: "seamshield.status/v1", target: root, local_scan: { config_exists: existsSync(configPath), investigation_dir: existsSync(join(root, ".seamshield", "investigations")) }, connection, next };
+  return { schema: "seamshield.status/v1", target: root, local_scan: { config_exists: existsSync(configPath), investigation_dir: existsSync(join(root, ".seamshield", "investigations")) }, capabilities, connection, next };
 }
 
 function renderStatusTable(report: ReturnType<typeof buildStatusReport>): string {
   const c = report.connection;
-  return ["SeamShield Status", "", `Target: ${report.target}`, `Local config: ${report.local_scan.config_exists ? "present" : "missing"}`, `Connected project: ${c?.project?.name || c?.project?.id || "not connected"}`, `Primary domain: ${c?.project?.primary_domain || "—"}`, `Last receipt: ${c?.last_sync_at || c?.connected_at || "—"}`, `CI: ${c?.ci?.status || "not configured"}`, "Source upload: false", "", `Next: ${report.next}`].join("\n");
+  const ci = c?.ci?.status === "configured" ? `${c.ci.provider} OIDC configured · workflow present locally` : c?.ci?.status || "not configured";
+  const languages = report.capabilities.languages.map((language) => language.id).join(", ") || "not detected";
+  const adapters = report.capabilities.coverage.deep_access_lane_adapters.join(", ") || "baseline coverage only";
+  return ["SeamShield Status", "", `Target: ${report.target}`, `Languages: ${languages}`, `Deep access-lane adapters: ${adapters}`, `Local config: ${report.local_scan.config_exists ? "present" : "missing"}`, `Connected project: ${c?.project?.name || c?.project?.id || "not connected"}`, `Primary domain: ${c?.project?.primary_domain || "—"}`, `Last receipt: ${c?.last_sync_at || c?.connected_at || "—"}`, `CI: ${ci}`, "Source upload: false", "", `Next: ${report.next}`].join("\n");
 }
 
 async function offlineExport(target: string, outPath?: string): Promise<string> {
@@ -2196,7 +2227,7 @@ const program = new Command();
 
 program
   .name("seamshield")
-  .description("Security scanner for AI-generated apps: finds the flaws vibecoded projects predictably ship.")
+  .description("Security scanner for AI-built repositories: baseline controls for every repo, deeper analysis for detected adapters.")
   .version(pkg.version);
 
 program
@@ -2334,7 +2365,7 @@ program
 
 program
   .command("inventory")
-  .description("Read local package, MCP, agent, extension, and deploy metadata without source upload")
+  .description("Read local repository capabilities, package, MCP, agent, extension, and deploy metadata without source upload")
   .argument("[path]", "project directory", ".")
   .option("--format <format>", "output format: table | json | ndjson", "table")
   .option("--profile <profile>", "inventory profile: community | workspace | incident", "community")
