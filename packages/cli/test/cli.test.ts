@@ -540,13 +540,14 @@ describe("seamshield scan (built CLI)", () => {
     expect(source).toContain('new Set(["run_scan", "investigate_high_lanes", "install_ci_workflow", "repair_ci_automation", "apply_source_fix"])');
     expect(source).toContain("approval_gated_remediation_plan_prepared");
     expect(source).toContain('.command("sentinel")');
+    expect(source).toContain('.command("enroll")');
     expect(source).toContain('.command("observe")');
     expect(source).toContain('.command("cloudflare")');
     expect(source).toContain('.command("install")');
     expect(source).toContain("CLOUDFLARE_API_TOKEN");
-    expect(source).toContain("sentinel/cloudflare/receipts");
+    expect(source).toContain("/v1/sentinel/edge/receipts");
     expect(source).toContain("OnUnitActiveSec=15min");
-    expect(source).toContain("sentinel/server/receipts");
+    expect(source).toContain("/v1/sentinel/runtimes/");
     expect(source).toContain(".seamshield/sentinel.json");
     expect(source).toContain("hostnames, IP addresses, logs, and credentials excluded");
     expect(source).not.toContain("raw repository text");
@@ -556,15 +557,12 @@ describe("seamshield scan (built CLI)", () => {
   it("exposes a source-private Sentinel server collector command", () => {
     const help = runCli(["sentinel", "observe", "--help"]);
     expect(help.status).toBe(0);
-    expect(help.stdout).toContain("--server-ref <id>");
+    expect(help.stdout).toContain("--runtime-id <id>");
     expect(help.stdout).toContain("hostnames, or IP addresses");
 
-    const invalidRef = runCliEnv(["sentinel", "observe", tempProject(), "--server-ref", "host.example.com"], {
-      SEAMSHIELD_PROJECT_ID: "project_test",
-      SEAMSHIELD_SERVER_KEY: "sssk_test",
-    });
-    expect(invalidRef.status).toBe(2);
-    expect(invalidRef.stderr).toContain("do not use a hostname or IP address");
+    const invalidEnrollment = runCli(["sentinel", "enroll", tempProject(), "--runtime-id", "host.example.com"]);
+    expect(invalidEnrollment.status).toBe(2);
+    expect(invalidEnrollment.stderr).toContain("opaque runtime id");
   });
 
   it("runs a Community doctor health check", () => {

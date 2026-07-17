@@ -854,27 +854,31 @@ type SentinelService = {
   state: "unknown";
 };
 
-type SentinelIdentity = {
-  schema: "seamshield.sentinel-identity/v1";
-  server_ref: string;
+type SentinelEnrollment = {
+  schema: "seamshield.sentinel-enrollment/v2";
+  runtime_id: string;
+  api_url: string;
+  enrolled_at: string;
 };
 
 function sentinelIdentityPath(target: string): string { return join(target, ".seamshield", "sentinel.json"); }
 
-function localSentinelIdentity(target: string): SentinelIdentity {
+function readSentinelEnrollment(target: string): SentinelEnrollment | null {
   const path = sentinelIdentityPath(target);
-  if (existsSync(path)) {
-    try {
-      const parsed = JSON.parse(readFileSync(path, "utf8"));
-      if (parsed?.schema === "seamshield.sentinel-identity/v1" && /^srv_[a-zA-Z0-9_-]{8,160}$/.test(String(parsed.server_ref || ""))) return parsed as SentinelIdentity;
-    } catch { /* Create a new opaque local identity below. */ }
-  }
-  const identity: SentinelIdentity = { schema: "seamshield.sentinel-identity/v1", server_ref: `srv_${randomUUID().replaceAll("-", "")}` };
+  if (!existsSync(path)) return null;
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf8"));
+    if (parsed?.schema === "seamshield.sentinel-enrollment/v2" && /^runtime_[a-zA-Z0-9_-]{8,160}$/.test(String(parsed.runtime_id || ""))) return parsed as SentinelEnrollment;
+  } catch { /* Invalid local state is treated as not enrolled. */ }
+  return null;
+}
+
+function writeSentinelEnrollment(target: string, enrollment: SentinelEnrollment): void {
+  const path = sentinelIdentityPath(target);
   mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, `${JSON.stringify(identity, null, 2)}\n`, { mode: 0o600 });
+  writeFileSync(path, `${JSON.stringify(enrollment, null, 2)}\n`, { mode: 0o600 });
   chmodSync(path, 0o600);
   ignoreLocalConnection(target);
-  return identity;
 }
 
 function boundedListeningTcpPorts(): SentinelService[] {
@@ -904,16 +908,17 @@ function shellQuote(value: string): string { return `'${String(value).replaceAll
 
 function installSentinelSchedule(target: string): number {
   const stored = readLocalConnection(target);
-  const projectId = stored?.project.id || process.env.SEAMSHIELD_PROJECT_ID || "";
-  if (!projectId) {
-    console.error("seamshield sentinel install: connect the project first so the service can resolve its project id");
+  const enrollment = readSentinelEnrollment(target);
+  const runtimeId = process.env.SEAMSHIELD_SENTINEL_RUNTIME_ID || enrollment?.runtime_id || "";
+  if (!runtimeId) {
+    console.error("seamshield sentinel install: enroll this runtime first with the one-time command from Sentinel");
     return 2;
   }
   if (process.platform !== "linux") {
     console.error("seamshield sentinel install: systemd user services are supported on Linux hosts only; use sentinel observe from your existing scheduler on this platform");
     return 2;
   }
-  const safeId = String(projectId).replace(/[^a-zA-Z0-9_.-]/g, "_");
+  const safeId = String(runtimeId).replace(/[^a-zA-Z0-9_.-]/g, "_");
   const configDir = join(homedir(), ".config", "seamshield", "sentinel", safeId);
   const systemdDir = join(homedir(), ".config", "systemd", "user");
   const envPath = join(configDir, "sentinel.env");
@@ -924,9 +929,9 @@ function installSentinelSchedule(target: string): number {
   if (!existsSync(envPath)) {
     writeFileSync(envPath, [
       "# Keep this file mode 0600. Values stay on this host and are never committed.",
-      `SEAMSHIELD_API_URL=${stored?.api_url || process.env.SEAMSHIELD_API_URL || DEFAULT_CONNECTED_API_URL}`,
-      `SEAMSHIELD_PROJECT_ID=${projectId}`,
-      "SEAMSHIELD_SERVER_KEY=",
+      `SEAMSHIELD_API_URL=${enrollment?.api_url || stored?.api_url || process.env.SEAMSHIELD_API_URL || DEFAULT_CONNECTED_API_URL}`,
+      `SEAMSHIELD_SENTINEL_RUNTIME_ID=${runtimeId}`,
+      "SEAMSHIELD_SENTINEL_KEY=",
       "# Optional: enables the local Cloudflare edge collector.",
       "CLOUDFLARE_API_TOKEN=",
       "",
@@ -937,7 +942,7 @@ function installSentinelSchedule(target: string): number {
     "#!/usr/bin/env sh",
     "set -eu",
     `set -a; . ${shellQuote(envPath)}; set +a`,
-    `: \"${"${SEAMSHIELD_SERVER_KEY:?set SEAMSHIELD_SERVER_KEY in sentinel.env}"}\"`,
+    `: \"${"${SEAMSHIELD_SENTINEL_KEY:?set SEAMSHIELD_SENTINEL_KEY in sentinel.env}"}\"`,
     `${shellQuote(process.execPath)} ${shellQuote(currentBin())} sentinel observe ${shellQuote(target)}`,
     `if [ -n \"${"${CLOUDFLARE_API_TOKEN:-}"}\" ]; then ${shellQuote(process.execPath)} ${shellQuote(currentBin())} sentinel cloudflare ${shellQuote(target)}; fi`,
     "",
@@ -959,23 +964,32 @@ function installSentinelSchedule(target: string): number {
   return 0;
 }
 
-async function observeSentinel(target: string, options: { apiUrl?: string; projectId?: string; serverRef?: string; environment?: string }): Promise<number> {
+async function enrollSentinel(target: string, options: { apiUrl?: string; runtimeId?: string }): Promise<number> {
+  const runtimeId = String(options.runtimeId || process.env.SEAMSHIELD_SENTINEL_RUNTIME_ID || "").trim();
+  if (!/^runtime_[a-zA-Z0-9_-]{8,160}$/.test(runtimeId)) {
+    console.error("seamshield sentinel enroll: --runtime-id must be the opaque runtime id from the Sentinel enrollment screen");
+    return 2;
+  }
+  const apiUrl = (options.apiUrl || process.env.SEAMSHIELD_API_URL || DEFAULT_CONNECTED_API_URL).replace(/\/$/, "");
+  writeSentinelEnrollment(target, { schema: "seamshield.sentinel-enrollment/v2", runtime_id: runtimeId, api_url: apiUrl, enrolled_at: new Date().toISOString() });
+  console.log(`Sentinel runtime enrolled · ${runtimeId}`);
+  console.log("Next: run seamshield sentinel observe from this runtime, or seamshield sentinel install on Linux for continuous 15-minute observations.");
+  console.log("Source upload: false · enrollment credentials remain in your server or CI secret store.");
+  return 0;
+}
+
+async function observeSentinel(target: string, options: { apiUrl?: string; runtimeId?: string; environment?: string }): Promise<number> {
   const stored = readLocalConnection(target);
-  const apiUrl = (options.apiUrl || process.env.SEAMSHIELD_API_URL || stored?.api_url || DEFAULT_CONNECTED_API_URL).replace(/\/$/, "");
-  const projectId = options.projectId || process.env.SEAMSHIELD_PROJECT_ID || stored?.project.id || "";
-  const serverKey = process.env.SEAMSHIELD_SERVER_KEY || stored?.server_key || "";
-  if (!projectId || !serverKey) {
-    console.error("seamshield sentinel observe: connect the project first or set SEAMSHIELD_PROJECT_ID and SEAMSHIELD_SERVER_KEY in the server secret store");
+  const enrollment = readSentinelEnrollment(target);
+  const apiUrl = (options.apiUrl || process.env.SEAMSHIELD_API_URL || enrollment?.api_url || stored?.api_url || DEFAULT_CONNECTED_API_URL).replace(/\/$/, "");
+  const runtimeId = options.runtimeId || process.env.SEAMSHIELD_SENTINEL_RUNTIME_ID || enrollment?.runtime_id || "";
+  const sentinelKey = process.env.SEAMSHIELD_SENTINEL_KEY || "";
+  if (!runtimeId || !sentinelKey) {
+    console.error("seamshield sentinel observe: enroll this runtime first, then set SEAMSHIELD_SENTINEL_KEY only in the server or CI secret store");
     return 2;
   }
   if (!existsSync(target)) {
     console.error(`seamshield: path not found: ${target}`);
-    return 2;
-  }
-  const generated = localSentinelIdentity(target);
-  const requestedRef = String(options.serverRef || process.env.SEAMSHIELD_SENTINEL_SERVER_REF || generated.server_ref).trim();
-  if (!/^srv_[a-zA-Z0-9_-]{8,160}$/.test(requestedRef)) {
-    console.error("seamshield sentinel observe: --server-ref must be an opaque srv_ identifier; do not use a hostname or IP address");
     return 2;
   }
   const environment = String(options.environment || process.env.SEAMSHIELD_ENVIRONMENT || "production").trim().toLowerCase();
@@ -984,32 +998,33 @@ async function observeSentinel(target: string, options: { apiUrl?: string; proje
     return 2;
   }
   const services = boundedListeningTcpPorts();
-  const response = await fetch(`${apiUrl}/v1/projects/${encodeURIComponent(projectId)}/sentinel/server/receipts`, {
+  const response = await fetch(`${apiUrl}/v1/sentinel/runtimes/${encodeURIComponent(runtimeId)}/receipts`, {
     method: "POST",
-    headers: { "content-type": "application/json", accept: "application/json", "x-seamshield-server-key": serverKey },
-    body: JSON.stringify({ server_ref: requestedRef, environment, collector_version: pkg.version, services, firewall_state: "unknown", tls_state: "unknown" }),
+    headers: { "content-type": "application/json", accept: "application/json", "x-seamshield-sentinel-key": sentinelKey },
+    body: JSON.stringify({ environment, collector_version: pkg.version, services, firewall_state: "unknown", tls_state: "unknown" }),
   });
   const body = await response.json().catch(() => ({})) as { error?: string; sentinel_observation?: { created_at?: string; digest?: string } };
   if (!response.ok) {
     console.error(`seamshield sentinel observe: ${String(body.error || `collector receipt rejected (${response.status})`)}`);
     return response.status === 401 || response.status === 403 ? 2 : 1;
   }
-  console.log(`Sentinel observation recorded · ${projectId}`);
-  console.log(`Server: ${requestedRef} · ${environment}`);
-  console.log(`Services: ${services.length} bounded TCP listeners · exposure unknown until edge evidence is connected`);
+  console.log(`Sentinel observation recorded · ${runtimeId}`);
+  console.log(`Runtime: ${runtimeId} · ${environment}`);
+  console.log(`Services: ${services.length} bounded TCP listeners · attach matching workload references in Sentinel to project their posture`);
   console.log(`Receipt: ${String(body.sentinel_observation?.digest || "recorded").slice(0, 18)} · ${body.sentinel_observation?.created_at || new Date().toISOString()}`);
   console.log("Source upload: false · hostnames, IP addresses, logs, and credentials excluded");
   return 0;
 }
 
-async function observeCloudflare(target: string, options: { apiUrl?: string; projectId?: string }): Promise<number> {
+async function observeCloudflare(target: string, options: { apiUrl?: string; edgeAttachmentIds?: string[] }): Promise<number> {
   const stored = readLocalConnection(target);
-  const apiUrl = (options.apiUrl || process.env.SEAMSHIELD_API_URL || stored?.api_url || DEFAULT_CONNECTED_API_URL).replace(/\/$/, "");
-  const projectId = options.projectId || process.env.SEAMSHIELD_PROJECT_ID || stored?.project.id || "";
-  const serverKey = process.env.SEAMSHIELD_SERVER_KEY || stored?.server_key || "";
+  const enrollment = readSentinelEnrollment(target);
+  const apiUrl = (options.apiUrl || process.env.SEAMSHIELD_API_URL || enrollment?.api_url || stored?.api_url || DEFAULT_CONNECTED_API_URL).replace(/\/$/, "");
+  const sentinelKey = process.env.SEAMSHIELD_SENTINEL_KEY || "";
   const cloudflareToken = String(process.env.CLOUDFLARE_API_TOKEN || "").trim();
-  if (!projectId || !serverKey) {
-    console.error("seamshield sentinel cloudflare: connect the project first or set SEAMSHIELD_PROJECT_ID and SEAMSHIELD_SERVER_KEY in the secret store");
+  const edgeAttachmentIds = options.edgeAttachmentIds?.length ? options.edgeAttachmentIds : String(process.env.SEAMSHIELD_SENTINEL_EDGE_ATTACHMENT_IDS || "").split(",").map((value) => value.trim()).filter(Boolean);
+  if (!enrollment?.runtime_id || !sentinelKey || !edgeAttachmentIds.length) {
+    console.error("seamshield sentinel cloudflare: enroll the runtime, set SEAMSHIELD_SENTINEL_KEY, and set SEAMSHIELD_SENTINEL_EDGE_ATTACHMENT_IDS from the Sentinel edge attachment");
     return 2;
   }
   if (!cloudflareToken) {
@@ -1040,16 +1055,16 @@ async function observeCloudflare(target: string, options: { apiUrl?: string; pro
         firewall_state: "unknown",
         tls_state: "unknown",
       };
-      const response = await fetch(`${apiUrl}/v1/projects/${encodeURIComponent(projectId)}/sentinel/cloudflare/receipts`, {
+      const response = await fetch(`${apiUrl}/v1/sentinel/edge/receipts`, {
         method: "POST",
-        headers: { "content-type": "application/json", accept: "application/json", "x-seamshield-server-key": serverKey },
-        body: JSON.stringify(body),
+        headers: { "content-type": "application/json", accept: "application/json", "x-seamshield-sentinel-key": sentinelKey },
+        body: JSON.stringify({ ...body, edge_attachment_ids: edgeAttachmentIds }),
       });
       const receipt = await response.json().catch(() => ({})) as { error?: string; sentinel_observation?: { digest?: string } };
       if (!response.ok) throw new Error(String(receipt.error || `SeamShield receipt rejected (${response.status})`));
       records.push(receipt.sentinel_observation?.digest || "recorded");
     }
-    console.log(`Sentinel Cloudflare observations recorded · ${projectId}`);
+    console.log(`Sentinel Cloudflare observations recorded · ${enrollment.runtime_id}`);
     console.log(`Zones: ${records.length} opaque zone references · DNS names and Cloudflare token excluded`);
     console.log(`Receipts: ${records.map((value) => String(value).slice(0, 12)).join(" · ") || "none"}`);
     console.log("Source upload: false · Cloudflare token stays in the local secret store");
@@ -2344,14 +2359,23 @@ const sentinel = program
   .description("Paid runtime infrastructure observation utilities");
 
 sentinel
+  .command("enroll")
+  .description("Save the opaque tenant-scoped Sentinel runtime id locally; keep the enrollment key in your server or CI secret store")
+  .argument("[path]", "directory holding the local Sentinel state", ".")
+  .requiredOption("--runtime-id <id>", "opaque Sentinel runtime id from the Console")
+  .option("--api-url <url>", "SeamShield backend base URL", process.env.SEAMSHIELD_API_URL || DEFAULT_CONNECTED_API_URL)
+  .action(async (path: string, opts: { apiUrl?: string; runtimeId?: string }) => {
+    process.exitCode = await enrollSentinel(resolve(path), opts);
+  });
+
+sentinel
   .command("observe")
   .description("Submit bounded server listener and posture metadata without source, logs, hostnames, or IP addresses")
   .argument("[path]", "directory holding the protected project connection", ".")
   .option("--api-url <url>", "SeamShield backend base URL", process.env.SEAMSHIELD_API_URL || DEFAULT_CONNECTED_API_URL)
-  .option("--project-id <id>", "provisioned SeamShield project id", process.env.SEAMSHIELD_PROJECT_ID)
-  .option("--server-ref <id>", "opaque Sentinel server reference; never a hostname or IP address")
+  .option("--runtime-id <id>", "opaque tenant-scoped Sentinel runtime id", process.env.SEAMSHIELD_SENTINEL_RUNTIME_ID)
   .option("--environment <name>", "deployment environment label", process.env.SEAMSHIELD_ENVIRONMENT || "production")
-  .action(async (path: string, opts: { apiUrl?: string; projectId?: string; serverRef?: string; environment?: string }) => {
+  .action(async (path: string, opts: { apiUrl?: string; runtimeId?: string; environment?: string }) => {
     try {
       process.exitCode = await observeSentinel(resolve(path), opts);
     } catch (error) {
@@ -2365,9 +2389,9 @@ sentinel
   .description("Read Cloudflare posture locally with a scoped customer token and submit only opaque edge metadata")
   .argument("[path]", "directory holding the protected project connection", ".")
   .option("--api-url <url>", "SeamShield backend base URL", process.env.SEAMSHIELD_API_URL || DEFAULT_CONNECTED_API_URL)
-  .option("--project-id <id>", "provisioned SeamShield project id", process.env.SEAMSHIELD_PROJECT_ID)
-  .action(async (path: string, opts: { apiUrl?: string; projectId?: string }) => {
-    process.exitCode = await observeCloudflare(resolve(path), opts);
+  .option("--edge-attachment-id <id...>", "opaque Sentinel edge attachment id from the Console")
+  .action(async (path: string, opts: { apiUrl?: string; edgeAttachmentId?: string[] }) => {
+    process.exitCode = await observeCloudflare(resolve(path), { apiUrl: opts.apiUrl, edgeAttachmentIds: opts.edgeAttachmentId });
   });
 
 sentinel
