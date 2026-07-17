@@ -524,6 +524,10 @@ describe("seamshield scan (built CLI)", () => {
     expect(source).toContain("absolute local path excluded");
     expect(source).toContain('DEFAULT_CONNECTED_API_URL = "https://platform.seamshield.com/api"');
     expect(source).toContain("Persistent enrollment:");
+    expect(source).toContain("requireReceiptDigest");
+    expect(source).toContain("The local connection was left unchanged.");
+    expect(source).toContain("Generate a fresh connection command in Build → Platform");
+    expect(source).toContain("Refreshed ${resolve(target)} for project");
     expect(source).toContain(".seamshield/connection.json");
     expect(source).toContain("SEAMSHIELD_SERVER_KEY");
     expect(source).toContain("ACTIONS_ID_TOKEN_REQUEST_URL");

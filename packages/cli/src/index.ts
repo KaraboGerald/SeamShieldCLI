@@ -1292,6 +1292,12 @@ async function exchangeCiCredential(apiUrl: string, projectId: string, provider:
   return body.access_token;
 }
 
+function requireReceiptDigest(value: unknown, label: string): string {
+  const digest = typeof value === "string" ? value.trim() : "";
+  if (!digest) throw new Error(`backend did not return a signed ${label} receipt`);
+  return digest;
+}
+
 async function connectProject(target: string, options: { projectId?: string; token?: string; apiUrl?: string; offline?: boolean; ci?: boolean; ciProvider?: string; ciRepositoryId?: string; ciIssuer?: string; ciJwksUri?: string; ciAudience?: string }): Promise<number> {
   const startedAt = Date.now();
   const stored = readLocalConnection(target);
@@ -1334,17 +1340,35 @@ async function connectProject(target: string, options: { projectId?: string; tok
   }));
   if (connectionToken) {
     const response = await fetch(`${apiUrl}/v1/projects/connections/redeem`, { method: "POST", headers: { "content-type": "application/json", accept: "application/json" }, body: JSON.stringify({ token: connectionToken, path_label: pathLabel, ci_binding: ciPlan?.binding, scan: { idempotency_key: idempotencyKey, profile: "community", counts, lanes: projectLanes }, inventory: { components: inventory.components.map((component: InventoryComponent) => ({ ecosystem: component.ecosystem, name: component.name, version: component.version })) } }) });
-    if (!response.ok) { console.error(`seamshield connect: connection token rejected (${response.status})`); return 1; }
-    const body = await response.json() as { connection?: { digest?: string; project?: { id?: string; name?: string; primary_domain?: string } }; connection_credential?: { server_key?: string }; scan_receipt?: { digest?: string; created_at?: string }; dependency_receipt?: { digest?: string } };
+    const body = await response.json().catch(() => ({})) as { error?: string; connection?: { digest?: string; project?: { id?: string; name?: string; primary_domain?: string } }; connection_credential?: { server_key?: string }; scan_receipt?: { digest?: string; created_at?: string }; dependency_receipt?: { digest?: string } };
+    if (!response.ok) {
+      const next = body.error === "connection_token_invalid_or_expired"
+        ? "Generate a fresh connection command in Build → Platform, or run `seamshield sync .` to refresh the existing connection."
+        : "The local connection was left unchanged.";
+      console.error(`seamshield connect: ${String(body.error || `connection token rejected (${response.status})`)}. ${next}`);
+      return 1;
+    }
+    let connectionDigest = "";
+    let scanDigest = "";
+    let dependencyDigest = "";
+    try {
+      connectionDigest = requireReceiptDigest(body.connection?.digest, "connection");
+      scanDigest = requireReceiptDigest(body.scan_receipt?.digest, "scan");
+      dependencyDigest = requireReceiptDigest(body.dependency_receipt?.digest, "dependency inventory");
+    } catch (error) {
+      console.error(`seamshield connect: ${error instanceof Error ? error.message : String(error)}. The local connection was left unchanged.`);
+      return 1;
+    }
     if (!body.connection?.project?.id || !body.connection_credential?.server_key) { console.error("seamshield connect: backend did not return a reusable project credential"); return 1; }
+    if (stored) console.log(`Replacing existing local enrollment for ${stored.project.name || stored.project.id} after receipt verification.`);
     console.log(`Connected ${pathLabel} via one-time project token`);
     console.log(`Project: ${body.connection?.project?.name || body.connection?.project?.id || "connected project"}${body.connection?.project?.primary_domain ? ` · ${body.connection.project.primary_domain}` : ""}`);
-    console.log(`Connection receipt: ${String(body.connection?.digest || "recorded").slice(0, 18)}`);
-    console.log(`Scan receipt: ${String(body.scan_receipt?.digest || "recorded").slice(0, 18)}`);
+    console.log(`Connection receipt: ${connectionDigest.slice(0, 18)}`);
+    console.log(`Scan receipt: ${scanDigest.slice(0, 18)}`);
     console.log(`Receipt time: ${body.scan_receipt?.created_at || new Date().toISOString()}`);
-    console.log(`Dependency receipt: ${String(body.dependency_receipt?.digest || "recorded").slice(0, 18)}`);
+    console.log(`Dependency receipt: ${dependencyDigest.slice(0, 18)}`);
     console.log("Source upload: false · absolute local path excluded");
-    const local: LocalConnection = { schema: "seamshield.local-connection/v1", project: body.connection.project, api_url: apiUrl, server_key: body.connection_credential.server_key, receipt_digest: body.connection.digest || null, scan_receipt_digest: body.scan_receipt?.digest || null, connected_at: body.scan_receipt?.created_at || new Date().toISOString(), last_sync_at: body.scan_receipt?.created_at || new Date().toISOString(), source_upload: false };
+    const local: LocalConnection = { schema: "seamshield.local-connection/v1", project: body.connection.project, api_url: apiUrl, server_key: body.connection_credential.server_key, receipt_digest: connectionDigest, scan_receipt_digest: scanDigest, connected_at: body.scan_receipt?.created_at || new Date().toISOString(), last_sync_at: body.scan_receipt?.created_at || new Date().toISOString(), source_upload: false };
     if (options.ci !== false && ciPlan) local.ci = installCiAutomation(target, { projectId: body.connection.project.id, apiUrl, provider: ciPlan.provider }, ciPlan);
     writeLocalConnection(target, local);
     console.log(`Persistent enrollment: ${connectionPath(target)} (git ignored · mode 0600)`);
@@ -1384,17 +1408,28 @@ async function connectProject(target: string, options: { projectId?: string; tok
   const guardResponse = await fetch(`${apiUrl}/v1/projects/${encodeURIComponent(projectId)}/guard/policy`, { headers: guardHeaders });
   if (!guardResponse.ok) { console.error(`seamshield connect: Guard policy rejected (${guardResponse.status})`); return 1; }
   const [scanBody, inventoryBody, releaseBody] = await Promise.all([
-    scanResponse.json() as Promise<{ scan_receipt?: { digest?: string } }>,
+    scanResponse.json() as Promise<{ scan_receipt?: { digest?: string; created_at?: string } }>,
     inventoryResponse.json() as Promise<{ dependency_receipt?: { digest?: string } }>,
     releaseResponse.json() as Promise<{ release_receipt?: { digest?: string } }>,
   ]);
+  let scanDigest = "";
+  let dependencyDigest = "";
+  let releaseDigest = "";
+  try {
+    scanDigest = requireReceiptDigest(scanBody.scan_receipt?.digest, "scan");
+    dependencyDigest = requireReceiptDigest(inventoryBody.dependency_receipt?.digest, "dependency inventory");
+    releaseDigest = requireReceiptDigest(releaseBody.release_receipt?.digest, "release gate");
+  } catch (error) {
+    console.error(`seamshield sync: ${error instanceof Error ? error.message : String(error)}. The local connection was left unchanged.`);
+    return 1;
+  }
   const prior = stored || { schema: "seamshield.local-connection/v1" as const, project: { id: projectId }, api_url: apiUrl, server_key: serverKey, source_upload: false as const };
-  const refreshedConnection: LocalConnection = { ...prior, project: { ...prior.project, id: projectId }, api_url: apiUrl, server_key: serverKey, scan_receipt_digest: scanBody.scan_receipt?.digest || prior.scan_receipt_digest || null, last_sync_at: new Date().toISOString(), source_upload: false };
+  const refreshedConnection: LocalConnection = { ...prior, project: { ...prior.project, id: projectId }, api_url: apiUrl, server_key: serverKey, scan_receipt_digest: scanDigest, last_sync_at: scanBody.scan_receipt?.created_at || new Date().toISOString(), source_upload: false };
   writeLocalConnection(target, refreshedConnection);
-  console.log(`Connected ${resolve(target)} to project ${projectId}`);
-  console.log(`Scan receipt: ${String(scanBody.scan_receipt?.digest || "recorded").slice(0, 18)}`);
-  console.log(`Dependency receipt: ${String(inventoryBody.dependency_receipt?.digest || "recorded").slice(0, 18)}`);
-  console.log(`Release receipt: ${String(releaseBody.release_receipt?.digest || "recorded").slice(0, 18)}`);
+  console.log(`Refreshed ${resolve(target)} for project ${prior.project.name || projectId}`);
+  console.log(`Scan receipt: ${scanDigest.slice(0, 18)}`);
+  console.log(`Dependency receipt: ${dependencyDigest.slice(0, 18)}`);
+  console.log(`Release receipt: ${releaseDigest.slice(0, 18)}`);
   console.log("Guard policy: verified");
   try {
     const agent = await processSecurityAgentJobs({
@@ -1404,7 +1439,7 @@ async function connectProject(target: string, options: { projectId?: string; tok
       headers,
       connection: refreshedConnection,
       result,
-      scanReceiptDigest: scanBody.scan_receipt?.digest || "",
+      scanReceiptDigest: scanDigest,
       ciPlan,
     });
     console.log(`Security Agent: ${agent.processed} job${agent.processed === 1 ? "" : "s"} processed${agent.waiting ? ` · ${agent.waiting} waiting for supported evidence` : ""}`);
