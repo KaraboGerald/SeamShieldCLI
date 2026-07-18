@@ -47,6 +47,7 @@ describe("seamshield scan (built CLI)", () => {
     expect(result.status).toBe(0);
     expect(result.stdout).toContain("connect [options] [path]");
     expect(result.stdout).toContain("sync [options] [path]");
+    expect(result.stdout).toContain("deploy-gate");
   });
 
   it("covers the Community provider fixtures", () => {
@@ -479,11 +480,13 @@ describe("seamshield scan (built CLI)", () => {
     expect(runCli(["ci", "install", github, "--provider", "github"]).status).toBe(0);
     const githubWorkflow = readFileSync(join(github, ".github", "workflows", "seamshield.yml"), "utf8");
     expect(githubWorkflow).toContain("id-token: write");
+    expect(githubWorkflow).toContain("workflow_call:");
     expect(githubWorkflow).toContain("npx @seamshield/cli sync . --ci --offline");
     expect(githubWorkflow).not.toContain("SEAMSHIELD_SERVER_KEY");
     const githubStatus = JSON.parse(runCli(["ci", "status", github, "--format", "json"]).stdout);
     expect(githubStatus.checks.continuous_sync).toBe(true);
     expect(githubStatus.checks.oidc_configured).toBe(true);
+    expect(githubStatus.checks.deployment_gate_ready).toBe(true);
     expect(githubStatus.diagnostics).toEqual([]);
 
     const gitlab = connectedProject("https://gitlab.com/acme/widget.git");

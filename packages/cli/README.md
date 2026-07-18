@@ -74,6 +74,7 @@ seamshield guard install .
 seamshield guard status .
 seamshield ci install .
 seamshield ci status .
+seamshield deploy-gate verify --commit "$SEAMSHIELD_DEPLOY_COMMIT"
 seamshield doctor .
 seamshield release verify .
 seamshield learn
@@ -149,6 +150,62 @@ The generated paid job writes local fix and test plans, runs the ship gate, and
 synchronizes bounded scan, dependency, release, and Guard metadata. Critical
 lanes fail the job. Remediation is agent-assisted and still requires customer
 approval before code is merged.
+
+### Private GitHub repositories without branch protection
+
+GitHub Actions and OIDC work on private repositories without an upgraded plan.
+Some GitHub plans cannot enforce required status checks on a private default
+branch; SeamShield does not claim that those merges are blocked. Instead, the
+generated `.github/workflows/seamshield.yml` is a reusable deployment gate.
+Make the production deploy job depend on it:
+
+```yaml
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  seamshield:
+    uses: ./.github/workflows/seamshield.yml
+  deploy:
+    needs: seamshield
+    runs-on: ubuntu-latest
+    steps:
+      - run: ./deploy-production.sh
+```
+
+The gate records a short-lived OIDC-backed receipt for the commit. A blocked
+SeamShield job prevents the dependent deploy job from running. This protects
+production deployment, but cannot stop someone from merging directly into an
+unprotected branch.
+
+### Coolify and DevPush deployment gate
+
+For a host that deploys directly from GitHub, add one pre-deployment command to
+the host configuration. Store these values in the host's encrypted secret
+manager, never in repository files:
+
+```text
+SEAMSHIELD_API_URL=https://platform.seamshield.com/api
+SEAMSHIELD_PROJECT_ID=project_...
+SEAMSHIELD_SERVER_KEY=sssk_...
+SEAMSHIELD_DEPLOY_COMMIT=<the deployment provider's immutable commit SHA>
+SEAMSHIELD_DEPLOY_BRANCH=main
+```
+
+Use this pre-deploy command:
+
+```bash
+npx @seamshield/cli deploy-gate verify --environment production --commit "$SEAMSHIELD_DEPLOY_COMMIT" --branch "$SEAMSHIELD_DEPLOY_BRANCH"
+```
+
+The command checks a signed passing Build and Guard receipt for that exact
+commit and fails closed for a missing, blocked, branch-mismatched, or expired
+receipt. It returns only receipt metadata. Coolify or DevPush must expose their
+immutable deployment commit as `SEAMSHIELD_DEPLOY_COMMIT` and branch as
+`SEAMSHIELD_DEPLOY_BRANCH`; do not substitute a branch name or a mutable tag for
+the commit. This protects a deployment even when GitHub cannot enforce branch
+checks for a private repository.
 
 Connected paid and trial syncs also check for signed Security Agent jobs. The
 CLI accepts only project-scoped, short-lived jobs from a fixed operation

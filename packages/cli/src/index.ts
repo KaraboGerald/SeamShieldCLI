@@ -644,6 +644,7 @@ function writeGithubAction(target: string, automation?: CiAutomation): string {
       "name: SeamShield",
       "",
       "on:",
+      "  workflow_call:",
       "  pull_request:",
       "  push:",
       "    branches: [main]",
@@ -1154,6 +1155,7 @@ function printCiActivationGuide(plan: CiPlan, ci?: LocalConnection["ci"]): void 
   if (ci.provider === "github") {
     console.log("Next approval: commit and push .github/workflows/seamshield.yml to your default branch.");
     console.log("GitHub Actions then runs SeamShield on pull requests and pushes to main; the first signed OIDC receipt activates continuous protection.");
+    console.log("Private repositories can use this reusable workflow as the dependency of their production deploy job. This gates deployment even when the GitHub plan cannot enforce a required branch check.");
     console.log("No GitHub token, repository secret, or long-lived CI key is required.");
     return;
   }
@@ -1304,7 +1306,7 @@ async function providerIdentityToken(provider: CiProvider, audience: string): Pr
   throw new Error(`${provider} OIDC identity is unavailable; expose it as SEAMSHIELD_ID_TOKEN in the provider-native SeamShield job`);
 }
 
-async function exchangeCiCredential(apiUrl: string, projectId: string, provider: CiProvider, audience: string, observation: { workflow_present: boolean; branch_protection_present: boolean | null }): Promise<string> {
+async function exchangeCiCredential(apiUrl: string, projectId: string, provider: CiProvider, audience: string, observation: { workflow_present: boolean; branch_protection_present: boolean | null; deployment_gate_present: boolean }): Promise<string> {
   const idToken = await providerIdentityToken(provider, audience);
   const response = await fetch(`${apiUrl}/v1/projects/${encodeURIComponent(projectId)}/ci/exchange`, {
     method: "POST",
@@ -1320,6 +1322,30 @@ function requireReceiptDigest(value: unknown, label: string): string {
   const digest = typeof value === "string" ? value.trim() : "";
   if (!digest) throw new Error(`backend did not return a signed ${label} receipt`);
   return digest;
+}
+
+async function verifyDeploymentGate(options: { projectId?: string; commit?: string; branch?: string; environment: string; apiUrl: string }): Promise<void> {
+  const projectId = options.projectId || process.env.SEAMSHIELD_PROJECT_ID || "";
+  const commitDigest = options.commit || process.env.SEAMSHIELD_DEPLOY_COMMIT || process.env.GITHUB_SHA || process.env.CI_COMMIT_SHA || process.env.BITBUCKET_COMMIT || process.env.BUILD_SOURCEVERSION || process.env.CIRCLE_SHA1 || "";
+  const serverKey = process.env.SEAMSHIELD_SERVER_KEY || "";
+  if (!projectId) throw new Error("set SEAMSHIELD_PROJECT_ID or pass --project-id");
+  if (!commitDigest) throw new Error("set SEAMSHIELD_DEPLOY_COMMIT or pass --commit");
+  if (!serverKey) throw new Error("set SEAMSHIELD_SERVER_KEY in the deployment host secret store");
+  const url = new URL(`${options.apiUrl.replace(/\/$/, "")}/v1/projects/${encodeURIComponent(projectId)}/release-gates/verification`);
+  url.searchParams.set("commit_digest", commitDigest);
+  url.searchParams.set("environment", options.environment);
+  const branch = options.branch || process.env.SEAMSHIELD_DEPLOY_BRANCH || "";
+  if (branch) url.searchParams.set("branch", branch);
+  const response = await fetch(url, { headers: { "x-seamshield-server-key": serverKey, accept: "application/json" } });
+  const body = await response.json().catch(() => ({})) as { error?: string; deployment_gate?: { allowed?: boolean; reason?: string; release_receipt_digest?: string | null; receipt_created_at?: string | null } };
+  const gate = body.deployment_gate;
+  if (!response.ok || !gate?.allowed) {
+    throw new Error(`deployment gate denied: ${gate?.reason || body.error || `verification failed (${response.status})`}`);
+  }
+  console.log(`Deployment gate passed · ${projectId} · ${commitDigest.slice(0, 12)}`);
+  console.log(`Release receipt: ${(gate.release_receipt_digest || "").slice(0, 18)}`);
+  console.log(`Receipt time: ${gate.receipt_created_at || "verified"}`);
+  console.log("Source upload: false · deployment host received metadata-only verification");
 }
 
 async function connectProject(target: string, options: { projectId?: string; token?: string; apiUrl?: string; offline?: boolean; ci?: boolean; ciProvider?: string; ciRepositoryId?: string; ciIssuer?: string; ciJwksUri?: string; ciAudience?: string }): Promise<number> {
@@ -1410,14 +1436,14 @@ async function connectProject(target: string, options: { projectId?: string; tok
       : /^(?:0|false|no)$/i.test(process.env.SEAMSHIELD_BRANCH_PROTECTION || "")
         ? false
         : null;
-    try { automationToken = await exchangeCiCredential(apiUrl, projectId, provider, audience, { workflow_present: ciStatus.checks.workflow_exists, branch_protection_present: branchProtection }); }
+    try { automationToken = await exchangeCiCredential(apiUrl, projectId, provider, audience, { workflow_present: ciStatus.checks.workflow_exists, branch_protection_present: branchProtection, deployment_gate_present: ciStatus.checks.deployment_gate_ready }); }
     catch (error) { console.error(`seamshield sync: ${error instanceof Error ? error.message : String(error)}`); return 1; }
   }
   const headers: Record<string, string> = { "content-type": "application/json", accept: "application/json" };
   if (automationToken) headers.authorization = `Bearer ${automationToken}`;
   else headers["x-seamshield-server-key"] = serverKey;
   const localCiStatus = buildCiStatus(target);
-  const scanResponse = await fetch(`${apiUrl}/v1/projects/${encodeURIComponent(projectId)}/scan-metadata/receipts`, { method: "POST", headers, body: JSON.stringify({ idempotency_key: idempotencyKey, profile: "community", path_label: pathLabel, counts, lanes: projectLanes, automation_observation: { workflow_present: localCiStatus.checks.workflow_exists, repository_identity_match: true, workflow_identity_match: localCiStatus.checks.continuous_sync, branch_protection_present: /^(?:1|true|yes)$/i.test(process.env.SEAMSHIELD_BRANCH_PROTECTION || "") ? true : /^(?:0|false|no)$/i.test(process.env.SEAMSHIELD_BRANCH_PROTECTION || "") ? false : null, observed_at: new Date().toISOString() } }) });
+  const scanResponse = await fetch(`${apiUrl}/v1/projects/${encodeURIComponent(projectId)}/scan-metadata/receipts`, { method: "POST", headers, body: JSON.stringify({ idempotency_key: idempotencyKey, profile: "community", path_label: pathLabel, counts, lanes: projectLanes, automation_observation: { workflow_present: localCiStatus.checks.workflow_exists, repository_identity_match: true, workflow_identity_match: localCiStatus.checks.continuous_sync, branch_protection_present: /^(?:1|true|yes)$/i.test(process.env.SEAMSHIELD_BRANCH_PROTECTION || "") ? true : /^(?:0|false|no)$/i.test(process.env.SEAMSHIELD_BRANCH_PROTECTION || "") ? false : null, deployment_gate_present: localCiStatus.checks.deployment_gate_ready, observed_at: new Date().toISOString() } }) });
   if (!scanResponse.ok) { console.error(`seamshield connect: scan metadata rejected (${scanResponse.status})`); return 1; }
   const inventoryResponse = await fetch(`${apiUrl}/v1/projects/${encodeURIComponent(projectId)}/dependencies/receipts`, { method: "POST", headers, body: JSON.stringify({ idempotency_key: idempotencyKey, components: inventory.components.map((component: InventoryComponent) => ({ ecosystem: component.ecosystem, name: component.name, version: component.version })) }) });
   if (!inventoryResponse.ok) { console.error(`seamshield connect: dependency inventory rejected (${inventoryResponse.status})`); return 1; }
@@ -1494,6 +1520,7 @@ function buildCiStatus(target: string) {
   const runsOfflineShip = content.includes("npx @seamshield/cli ship . --offline") || content.includes("npx @seamshield/cli sync . --ci");
   const continuousSync = content.includes("npx @seamshield/cli sync . --ci");
   const oidcConfigured = /id-token|id_tokens|oidc:\s*true|OIDC_TOKEN|SEAMSHIELD_ID_TOKEN/i.test(content);
+  const deploymentGateReady = provider === "github" && content.includes("workflow_call:") && continuousSync && oidcConfigured;
   const uploadsInvestigations =
     content.includes("actions/upload-artifact") &&
     content.includes(".seamshield/investigations/") &&
@@ -1506,6 +1533,7 @@ function buildCiStatus(target: string) {
   if (!workflowExists) diagnostics.push({ category: "workflow_installation", code: "workflow_missing", message: `The provider workflow was not found at ${path}.` });
   if (workflowExists && connection && !oidcConfigured) diagnostics.push({ category: "permissions", code: "oidc_permission_missing", message: "The connected workflow cannot request a provider OIDC identity." });
   if (workflowExists && connection && !continuousSync) diagnostics.push({ category: "workflow_installation", code: "continuous_sync_missing", message: "The workflow does not run connected Build and Guard synchronization." });
+  if (workflowExists && connection && provider === "github" && !deploymentGateReady) diagnostics.push({ category: "workflow_installation", code: "deployment_gate_missing", message: "This workflow cannot yet be called by a production deploy job as its SeamShield gate." });
   return {
     schema: "seamshield.ci-status/v1",
     target: root,
@@ -1520,6 +1548,7 @@ function buildCiStatus(target: string) {
       investigations_uploaded_on_failure: uploadsInvestigations,
       continuous_sync: continuousSync,
       oidc_configured: oidcConfigured,
+      deployment_gate_ready: deploymentGateReady,
     },
     diagnostics,
     next: installed
@@ -1544,6 +1573,7 @@ function renderCiStatusTable(status: ReturnType<typeof buildCiStatus>): string {
     `Investigations uploaded on failure: ${status.checks.investigations_uploaded_on_failure ? "yes" : "no"}`,
     `Continuous sync: ${status.checks.continuous_sync ? "yes" : "no"}`,
     `OIDC configured: ${status.checks.oidc_configured ? "yes" : "no"}`,
+    `Reusable deployment gate: ${status.checks.deployment_gate_ready ? "yes" : "no"}`,
     "",
     "Recovery diagnostics:",
     ...(status.diagnostics.length
@@ -2746,6 +2776,28 @@ ci
     const status = buildCiStatus(path);
     console.log(opts.format === "json" ? `${JSON.stringify(status, null, 2)}\n` : renderCiStatusTable(status));
     process.exitCode = 0;
+  });
+
+const deploymentGate = program
+  .command("deploy-gate")
+  .description("Fail closed unless this exact deployment commit has a signed passing SeamShield receipt");
+
+deploymentGate
+  .command("verify")
+  .description("Verify a signed Build and Guard receipt before a production deployment")
+  .option("--project-id <id>", "SeamShield project id (or SEAMSHIELD_PROJECT_ID)", process.env.SEAMSHIELD_PROJECT_ID)
+  .option("--commit <sha>", "commit being deployed (or SEAMSHIELD_DEPLOY_COMMIT)")
+  .option("--branch <name>", "branch being deployed (or SEAMSHIELD_DEPLOY_BRANCH)")
+  .option("--environment <name>", "deployment environment", "production")
+  .option("--api-url <url>", "SeamShield backend base URL", process.env.SEAMSHIELD_API_URL || DEFAULT_CONNECTED_API_URL)
+  .action(async (opts: { projectId?: string; commit?: string; environment: string; apiUrl: string }) => {
+    try {
+      await verifyDeploymentGate(opts);
+      process.exitCode = 0;
+    } catch (error) {
+      console.error(`seamshield: ${error instanceof Error ? error.message : String(error)}`);
+      process.exitCode = 1;
+    }
   });
 
 program.parse();

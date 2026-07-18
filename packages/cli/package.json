@@ -1,6 +1,6 @@
 {
   "name": "@seamshield/cli",
-  "version": "0.3.24",
+  "version": "0.3.25",
   "description": "Community access-lane scanner and local control engine for AI-built repositories",
   "type": "module",
   "license": "MIT",
