@@ -89,10 +89,10 @@ seamshield init . --no-agent-context --no-guard --no-ci
 ```
 
 Bootstraps SeamShield in a repo. It writes `.seamshield/config.yaml`, generates
-portable agent context with `agent-context --all` by default, installs the
-supported Claude Code guard, writes GitHub and GitLab CI templates, runs the
-first offline ship check, writes a Markdown investigation, and prints the next
-command to run.
+portable agent context for every supported AI IDE with `agent-context --all` by
+default, installs the native Claude Code guard when that hook is configured,
+writes GitHub and GitLab CI templates, runs the first offline ship check,
+writes a Markdown investigation, and prints the next command to run.
 
 Use `--agents <list>` to write only selected local agent context files. Supported
 values are `codex`, `claude`, `cursor`, `gemini`, `cline`, `windsurf`,
@@ -429,7 +429,8 @@ seamshield guard status . --format json
 `.opencode/AGENTS.md`. Use `--all` to generate every supported adapter from
 the same SeamShield rule body.
 
-`guard install` adds a Claude Code `PreToolUse` hook that blocks
+`guard install` adds the currently supported native Claude Code `PreToolUse`
+hook that blocks
 high-confidence risky edits such as committed dotenv files, exposed server
 secrets, public database/storage writes, unsafe `.env` edits, dangerous shell
 installs, and obvious privileged route exposure.
@@ -437,7 +438,7 @@ installs, and obvious privileged route exposure.
 Guard behavior is fail-open: if the hook errors, it allows the tool call and
 appends diagnostics to `.seamshield/guard.log`.
 
-`guard status` reports whether the supported Claude Code hook is installed,
+`guard status` reports whether the native Claude Code hook is installed,
 whether it is parseable, which matcher is configured, and whether the hook
 points at the current SeamShield binary.
 
