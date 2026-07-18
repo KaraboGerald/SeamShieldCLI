@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 import { execFileSync, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { accessSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { accessSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { constants as fsConstants } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, extname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Command } from "commander";
 import { parse, stringify } from "yaml";
@@ -58,6 +58,42 @@ type ContextAgent = (typeof CONTEXT_AGENTS)[number];
 function cliPackageDir(): string {
   return resolve(dirname(currentBin()), "..");
 }
+const INSPECT_FORMATS = ["table", "json"];
+
+const INSPECT_IGNORED_DIRECTORIES = new Set([
+  ".git", ".next", ".nuxt", ".svelte-kit", ".turbo", ".seamshield", "build", "coverage", "dist",
+  "node_modules", "target", "vendor", ".venv", "venv", "__pycache__",
+]);
+const INSPECT_MAX_FILES = 3_000;
+const INSPECT_CONTENT_BYTES = 16_384;
+
+type InspectionSurface = {
+  id: string;
+  label: string;
+  status: "observed" | "not_observed";
+  evidence_count: number;
+  local_evidence: string[];
+};
+
+type RepositoryInspection = {
+  schema: "seamshield.repository-inspection/v1";
+  generated_at: string;
+  target: string;
+  source_upload: false;
+  local_execution: true;
+  file_inventory: { scanned_files: number; capped: boolean; languages: Record<string, number> };
+  surfaces: InspectionSurface[];
+  protection_gaps: Array<{ id: string; priority: "high" | "medium"; summary: string; next_action: string }>;
+  protection_manifest: {
+    schema: "seamshield.protection-manifest/v1";
+    source_upload: false;
+    raw_paths_excluded: true;
+    prompts_excluded: true;
+    credentials_excluded: true;
+    detected_capabilities: string[];
+    required_next_receipts: string[];
+  };
+};
 
 function parseContextAgents(value: string | undefined): ContextAgent[] | null {
   if (!value) return null;
@@ -194,6 +230,170 @@ function renderPrivacyTable(report: ReturnType<typeof buildPrivacyReport>): stri
     `- Automatic untrusted updates: ${report.rule_updates.automatic_untrusted_updates ? "yes" : "no"}`,
     `- learn: ${report.rule_updates.learn_command}`,
   ].join("\n");
+}
+
+function inspectRepositoryFiles(root: string): { files: string[]; capped: boolean; languages: Record<string, number> } {
+  const files: string[] = [];
+  const languages: Record<string, number> = {};
+  let capped = false;
+  const visit = (directory: string) => {
+    if (capped) return;
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      if (entry.isDirectory() && INSPECT_IGNORED_DIRECTORIES.has(entry.name)) continue;
+      const absolute = join(directory, entry.name);
+      if (entry.isDirectory()) {
+        visit(absolute);
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      files.push(relative(root, absolute));
+      const extension = extname(entry.name).toLowerCase() || "[no extension]";
+      languages[extension] = (languages[extension] ?? 0) + 1;
+      if (files.length >= INSPECT_MAX_FILES) {
+        capped = true;
+        return;
+      }
+    }
+  };
+  visit(root);
+  return { files, capped, languages };
+}
+
+function localFileContains(root: string, paths: string[], expression: RegExp): string[] {
+  const evidence: string[] = [];
+  for (const path of paths) {
+    if (evidence.length >= 24) break;
+    const extension = extname(path).toLowerCase();
+    if (!new Set([".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".py", ".go", ".rb", ".php", ".java", ".kt", ".cs", ".json", ".yaml", ".yml", ".toml", ".xml"]).has(extension)) continue;
+    try {
+      const stat = statSync(join(root, path));
+      if (stat.size > 1_000_000) continue;
+      const body = readFileSync(join(root, path), "utf8").slice(0, INSPECT_CONTENT_BYTES);
+      if (expression.test(body)) evidence.push(path);
+      expression.lastIndex = 0;
+    } catch {
+      // A changed or unreadable local file is simply omitted from reconnaissance.
+    }
+  }
+  return evidence;
+}
+
+function surface(id: string, label: string, evidence: string[]): InspectionSurface {
+  return {
+    id,
+    label,
+    status: evidence.length > 0 ? "observed" : "not_observed",
+    evidence_count: evidence.length,
+    local_evidence: evidence,
+  };
+}
+
+function buildRepositoryInspection(target: string): RepositoryInspection {
+  const root = resolve(target);
+  const inventory = inspectRepositoryFiles(root);
+  const matching = (...candidates: string[]) => inventory.files.filter((path) => candidates.some((candidate) => path.endsWith(candidate)));
+  const packageEvidence = matching("package.json");
+  const authEvidence = [
+    ...localFileContains(root, packageEvidence, /(?:nextauth|better-auth|convex|supabase|firebase|auth0|clerk|lucia|passport|keycloak)/i),
+    ...localFileContains(root, inventory.files, /(?:getServerSession|auth\.getUserIdentity|createClient\(|verifyIdToken|requireAuth|authenticate)/i),
+  ];
+  const serverEvidence = [
+    ...matching("Dockerfile", "docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml"),
+    ...localFileContains(root, inventory.files, /(?:listen\(|createServer\(|FastAPI\(|Django|Rails\.application|gin\.Default\(|app\.Run\()/),
+  ];
+  const ciEvidence = inventory.files.filter((path) => path.startsWith(".github/workflows/") || path === ".gitlab-ci.yml" || path === ".circleci/config.yml" || path.startsWith("azure-pipelines"));
+  const deployEvidence = [
+    ...matching("vercel.json", "netlify.toml", "wrangler.toml", "coolify.json", "fly.toml", "render.yaml", "railway.json", "app.yaml"),
+    ...localFileContains(root, inventory.files, /(?:coolify|devpush|vercel|cloudflare|netlify|railway|render\.com)/i),
+  ];
+  const runtimeEvidence = [
+    ...matching("package.json", "pyproject.toml", "requirements.txt", "go.mod", "Cargo.toml", "Gemfile", "composer.json", "pom.xml", "build.gradle", "build.gradle.kts"),
+  ];
+  const agentEvidence = inventory.files.filter((path) => /(?:^|\/)(?:AGENTS\.md|CLAUDE\.md|GEMINI\.md|\.clinerules\/|\.cursor\/rules\/|\.windsurf\/rules\/|\.github\/copilot-instructions\.md)/.test(path));
+  const surfaces = [
+    surface("runtime", "Application runtimes", runtimeEvidence),
+    surface("server", "Server and service boundaries", serverEvidence),
+    surface("auth", "Existing authentication", [...new Set(authEvidence)]),
+    surface("ci", "Continuous integration", ciEvidence),
+    surface("deploy", "Deployment and hosting", [...new Set(deployEvidence)]),
+    surface("agent", "AI coding-agent instructions", agentEvidence),
+  ];
+  const observed = (id: string) => surfaces.find((item) => item.id === id)?.status === "observed";
+  const protectionGaps: RepositoryInspection["protection_gaps"] = [];
+  if (!observed("ci")) protectionGaps.push({ id: "ci_missing", priority: "high", summary: "No supported CI workflow was found.", next_action: "Install the generated CI workflow, then verify the first protected push or merge." });
+  if (!observed("server")) protectionGaps.push({ id: "server_boundary_unknown", priority: "medium", summary: "No deployable server boundary was identified from local metadata.", next_action: "Use the local agent review to identify the production ingress and add Sentinel discovery there." });
+  if (!observed("auth")) protectionGaps.push({ id: "auth_boundary_unknown", priority: "medium", summary: "No known authentication integration was identified.", next_action: "Ask the local agent to map sign-in, session verification, and sensitive routes before enabling SeamAuth enforcement." });
+  if (!observed("deploy")) protectionGaps.push({ id: "deploy_target_unknown", priority: "medium", summary: "No supported deployment configuration was identified.", next_action: "Record the hosting provider during project setup; SeamShield will generate a provider-specific pre-deploy gate." });
+  if (!observed("agent")) protectionGaps.push({ id: "agent_instructions_missing", priority: "medium", summary: "No local AI agent instruction file was found.", next_action: "Run seamshield init or seamshield agent-context so your coding agent follows the protection review." });
+  const capabilities = surfaces.filter((item) => item.status === "observed").map((item) => item.id);
+  return {
+    schema: "seamshield.repository-inspection/v1",
+    generated_at: new Date().toISOString(),
+    target: root,
+    source_upload: false,
+    local_execution: true,
+    file_inventory: { scanned_files: inventory.files.length, capped: inventory.capped, languages: inventory.languages },
+    surfaces,
+    protection_gaps: protectionGaps,
+    protection_manifest: {
+      schema: "seamshield.protection-manifest/v1",
+      source_upload: false,
+      raw_paths_excluded: true,
+      prompts_excluded: true,
+      credentials_excluded: true,
+      detected_capabilities: capabilities,
+      required_next_receipts: ["repository_connection", "protected_ci_run", ...(observed("server") ? ["sentinel_discovery"] : []), ...(observed("auth") ? ["seamauth_runtime_decision"] : [])],
+    },
+  };
+}
+
+function renderRepositoryInspection(report: RepositoryInspection): string {
+  return [
+    "SeamShield Repository Inspection",
+    "",
+    `Target: ${report.target}`,
+    `Files inspected locally: ${report.file_inventory.scanned_files}${report.file_inventory.capped ? " (capped)" : ""}`,
+    "Source upload: no",
+    "",
+    "Observed surfaces:",
+    ...report.surfaces.map((item) => `- ${item.label}: ${item.status === "observed" ? `observed (${item.evidence_count} local evidence file${item.evidence_count === 1 ? "" : "s"})` : "not observed"}`),
+    "",
+    "Protection gaps:",
+    ...(report.protection_gaps.length > 0 ? report.protection_gaps.map((gap) => `- [${gap.priority}] ${gap.summary} Next: ${gap.next_action}`) : ["- No baseline setup gaps detected. Review the local agent assessment before enforcement."]),
+    "",
+    "Wrote local-only outputs:",
+    "- .seamshield/repository-assessment.md (local evidence and agent review instructions)",
+    "- .seamshield/protection-manifest.json (bounded metadata only; not uploaded by this command)",
+  ].join("\n");
+}
+
+function writeRepositoryInspection(target: string): { report: RepositoryInspection; assessmentPath: string; manifestPath: string } {
+  const root = resolve(target);
+  const report = buildRepositoryInspection(root);
+  const outputDirectory = join(root, ".seamshield");
+  mkdirSync(outputDirectory, { recursive: true });
+  const assessmentPath = join(outputDirectory, "repository-assessment.md");
+  const manifestPath = join(outputDirectory, "protection-manifest.json");
+  const localEvidence = report.surfaces.flatMap((item) => item.local_evidence.map((path) => `- ${item.label}: \`${path}\``));
+  const assessment = [
+    "# SeamShield Local Repository Assessment",
+    "",
+    "This assessment was generated locally. It is not uploaded by SeamShield. Do not paste source, credentials, prompts, or session values into external tools.",
+    "",
+    "## Local Evidence",
+    ...(localEvidence.length > 0 ? localEvidence : ["- No supported framework markers found. Inspect the repository structure locally."]),
+    "",
+    "## Gaps To Resolve",
+    ...(report.protection_gaps.length > 0 ? report.protection_gaps.map((gap) => `- **${gap.priority} - ${gap.id}:** ${gap.summary} ${gap.next_action}`) : ["- No baseline setup gaps detected."]),
+    "",
+    "## Local AI Review Contract",
+    "Use your local coding agent to inspect this repository. It must map the actual request ingress, auth verification, runtime/server processes, deployment workflow, and sensitive access lanes. It must cite local paths and line ranges in its response, propose approval-gated changes only, and never print or transmit secrets, raw tokens, source files, prompts, customer data, or session values.",
+    "",
+    "Required output: (1) architecture map, (2) authentication and authorization boundaries, (3) server/deployment boundaries, (4) top risks ranked by reachability, (5) recommended SeamShield Build, Guard, Sentinel, and SeamAuth integration points, and (6) a test plan proving each integration.",
+  ].join("\n");
+  writeFileSync(assessmentPath, `${assessment}\n`);
+  writeFileSync(manifestPath, `${JSON.stringify(report.protection_manifest, null, 2)}\n`);
+  return { report, assessmentPath, manifestPath };
 }
 
 function maybeWriteInvestigation(result: Awaited<ReturnType<typeof scanAsync>>, enabled: boolean | undefined): void {
@@ -520,6 +720,8 @@ function agentContextBody(kind: ContextAgent): string {
   return [
     "# SEAMSHIELD",
     "",
+    "- Read `.seamshield/repository-assessment.md` before proposing SeamShield setup. Use its local evidence to map the real ingress, auth, server, CI, and deployment paths; do not infer them from framework names alone.",
+    "- Keep the review local: cite file paths and line ranges, but never print or transmit secrets, raw tokens, sessions, prompts, customer data, or complete source files.",
     "- Run `npx @seamshield/cli ship .` before deploys and `npx @seamshield/cli scan --offline` before committing AI-generated changes.",
     "- Review `.seamshield/investigations/` after scans; it explains findings and open access lanes in Markdown.",
     "- Never hardcode provider keys, service-role keys, private keys, or dotenv contents.",
@@ -1945,6 +2147,8 @@ async function initProject(
 
   const wrote: string[] = [];
   wrote.push(ensureConfig(target));
+  const inspection = writeRepositoryInspection(target);
+  wrote.push(inspection.assessmentPath, inspection.manifestPath);
   if (opts.agentContext !== false) wrote.push(...writeAgentContexts(target, selectedAgents ?? CONTEXT_AGENTS));
   if (opts.guard !== false) wrote.push(installGuard(target));
   if (opts.ci !== false) wrote.push(writeGithubAction(target));
@@ -1964,7 +2168,8 @@ async function initProject(
   console.log("");
   console.log(renderShipTable(verdict));
   console.log("");
-  console.log("Next: seamshield status .");
+  console.log("Next: open .seamshield/repository-assessment.md with your local coding agent before enabling runtime enforcement.");
+  console.log("Then run: seamshield status .");
   process.exitCode = verdict.exitCode;
 }
 
@@ -2272,6 +2477,30 @@ program
   .option("--root <path>", "explicit root for workspace or incident profiles", collectRoot, [])
   .action((path: string, opts: { format: string; failOn: string; offline?: boolean; investigation?: boolean; profile?: string; root?: string[] }) => {
     return runScan(path, opts);
+  });
+
+program
+  .command("inspect")
+  .description("Map local runtime, auth, CI, deployment, server, and AI-agent surfaces before connecting a project")
+  .argument("[path]", "project directory", ".")
+  .option("--format <format>", "output format: table | json", "table")
+  .option("--write", "write local assessment and bounded protection manifest", false)
+  .action((path: string, opts: { format: string; write?: boolean }) => {
+    if (!assertChoice(opts.format, INSPECT_FORMATS, "format")) return;
+    if (!existsSync(path)) {
+      console.error(`seamshield: path not found: ${path}`);
+      process.exitCode = 2;
+      return;
+    }
+    const output: { report: RepositoryInspection; assessmentPath?: string; manifestPath?: string } = opts.write
+      ? writeRepositoryInspection(path)
+      : { report: buildRepositoryInspection(path) };
+    console.log(opts.format === "json" ? `${JSON.stringify(output.report, null, 2)}\n` : renderRepositoryInspection(output.report));
+    if (opts.write && opts.format !== "json" && output.assessmentPath && output.manifestPath) {
+      console.log(`\nAssessment: ${output.assessmentPath}`);
+      console.log(`Protection manifest: ${output.manifestPath}`);
+    }
+    process.exitCode = 0;
   });
 
 program

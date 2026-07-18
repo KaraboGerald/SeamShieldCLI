@@ -45,6 +45,7 @@ not invent routes, authorization findings, or coverage it has not verified.
 
 ```bash
 seamshield init .
+seamshield inspect . --write
 seamshield ship .
 seamshield access . --format table
 seamshield access . --format json
@@ -91,13 +92,38 @@ seamshield init . --no-agent-context --no-guard --no-ci
 Bootstraps SeamShield in a repo. It writes `.seamshield/config.yaml`, generates
 portable agent context for every supported AI IDE with `agent-context --all` by
 default, installs the native Claude Code guard when that hook is configured,
-writes GitHub and GitLab CI templates, runs the first offline ship check,
-writes a Markdown investigation, and prints the next command to run.
+writes GitHub and GitLab CI templates, runs a local repository inspection and
+first offline ship check, writes a Markdown investigation, and prints the next
+command. The inspection creates a local architecture assessment for Codex,
+Claude Code, Cursor, Cline, Windsurf, Copilot, Gemini, or OpenCode to review
+before runtime protection is configured.
 
 Use `--agents <list>` to write only selected local agent context files. Supported
 values are `codex`, `claude`, `cursor`, `gemini`, `cline`, `windsurf`,
 `copilot`, `opencode`, or `all`. This only controls Community agent instruction
 files; it does not enable Pro rulepacks or Enterprise policy services.
+
+## Repository Inspection
+
+```bash
+seamshield inspect .
+seamshield inspect . --write
+seamshield inspect . --format json
+```
+
+`inspect` maps local runtime, server, authentication, CI, deployment, and coding
+agent surfaces before a project is connected. `--write` produces two local files:
+
+- `.seamshield/repository-assessment.md`: path-level evidence and a constrained
+  review contract for your coding agent.
+- `.seamshield/protection-manifest.json`: a bounded capability summary for a
+  future connected setup. It excludes raw paths, source, prompts, credentials,
+  and session values, and this command never uploads it.
+
+The coding agent should use the assessment to verify real request ingress,
+session verification, server processes, deployment workflow, and sensitive access
+lanes. Its recommendations remain approval-gated; SeamShield does not grant it
+authority to modify infrastructure or transmit repository contents.
 
 The GitHub Actions workflow runs:
 

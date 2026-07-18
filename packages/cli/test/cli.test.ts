@@ -261,6 +261,42 @@ describe("seamshield scan (built CLI)", () => {
     expect(runCli(["privacy", dir, "--format", "xml"]).status).toBe(2);
   });
 
+  it("inspects a repository locally and writes a source-private protection manifest", () => {
+    const dir = tempProject();
+    mkdirSync(join(dir, ".github", "workflows"), { recursive: true });
+    writeFileSync(join(dir, ".github", "workflows", "ci.yml"), "name: CI\n");
+    writeFileSync(join(dir, "Dockerfile"), "FROM node:20\n");
+    writeFileSync(join(dir, "auth.ts"), "export const auth = getServerSession();\n");
+
+    const result = runCli(["inspect", dir, "--write", "--format", "json"]);
+    expect(result.status).toBe(0);
+    const parsed = JSON.parse(result.stdout) as {
+      schema: string;
+      source_upload: boolean;
+      surfaces: Array<{ id: string; status: string }>;
+      protection_manifest: { raw_paths_excluded: boolean; credentials_excluded: boolean };
+    };
+    expect(parsed.schema).toBe("seamshield.repository-inspection/v1");
+    expect(parsed.source_upload).toBe(false);
+    expect(parsed.surfaces).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: "ci", status: "observed" }),
+      expect.objectContaining({ id: "server", status: "observed" }),
+      expect.objectContaining({ id: "auth", status: "observed" }),
+    ]));
+    expect(parsed.protection_manifest).toEqual(expect.objectContaining({
+      raw_paths_excluded: true,
+      credentials_excluded: true,
+    }));
+    const assessment = readFileSync(join(dir, ".seamshield", "repository-assessment.md"), "utf8");
+    expect(assessment).toContain("Local AI Review Contract");
+    expect(assessment).toContain("auth.ts");
+    const manifest = JSON.parse(readFileSync(join(dir, ".seamshield", "protection-manifest.json"), "utf8")) as {
+      raw_paths_excluded: boolean;
+      credentials_excluded: boolean;
+    };
+    expect(manifest).toEqual(expect.objectContaining({ raw_paths_excluded: true, credentials_excluded: true }));
+  });
+
   it("writes a fix plan", () => {
     const dir = tempProject();
     writeFileSync(join(dir, "index.ts"), `const k = "sk_live_${"D".repeat(24)}";\n`);
