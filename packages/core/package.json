@@ -24,13 +24,13 @@
   "dependencies": {
     "@seamshield/rules": "workspace:*",
     "picocolors": "^1.1.0",
-    "yaml": "^2.5.0",
+    "yaml": "^2.8.3",
     "zod": "^4.0.0"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
-    "tsup": "^8.3.0",
-    "typescript": "^5.7.0",
-    "vitest": "^3.0.0"
+    "tsup": "^8.5.1",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.6"
   }
 }
