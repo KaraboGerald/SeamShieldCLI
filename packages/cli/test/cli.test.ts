@@ -790,4 +790,16 @@ describe("seamshield scan (built CLI)", () => {
       "ss/secrets/hardcoded-provider-key",
     );
   });
+
+  it("denies Guard paths that escape its temporary sandbox", () => {
+    const input = JSON.stringify({
+      tool_name: "Write",
+      tool_input: { file_path: "../../outside.ts", content: "export const safe = true;\n" },
+    });
+    const result = runCliWithInput(["guard", "check"], input);
+    expect(result.status).toBe(0);
+    const parsed = JSON.parse(result.stdout) as { hookSpecificOutput: { permissionDecision?: string; permissionDecisionReason?: string } };
+    expect(parsed.hookSpecificOutput.permissionDecision).toBe("deny");
+    expect(parsed.hookSpecificOutput.permissionDecisionReason).toContain("ss/guard/unsafe-file-path");
+  });
 });

@@ -1008,6 +1008,16 @@ function writeGenericCiScript(target: string, automation: CiAutomation): string 
 
 const DEFAULT_CONNECTED_API_URL = "https://platform.seamshield.com/api";
 
+function trustedConnectedApiUrl(value: unknown): string | null {
+  try {
+    const url = new URL(String(value || "").trim());
+    const expected = new URL(DEFAULT_CONNECTED_API_URL);
+    return url.origin === expected.origin && url.pathname.replace(/\/$/, "") === expected.pathname ? DEFAULT_CONNECTED_API_URL : null;
+  } catch {
+    return null;
+  }
+}
+
 type LocalConnection = {
   schema: "seamshield.local-connection/v1";
   project: { id?: string; name?: string; primary_domain?: string };
@@ -1020,6 +1030,12 @@ type LocalConnection = {
   source_upload: false;
   ci?: { provider: CiProvider; repository?: string; status: "configured" | "authorization_required" | "unsupported"; reason?: string };
 };
+
+function connectedApiUrl(explicit: unknown, stored: LocalConnection | null): string {
+  const selected = String(explicit || "").trim();
+  if (selected) return selected.replace(/\/$/, "");
+  return trustedConnectedApiUrl(stored?.api_url) || DEFAULT_CONNECTED_API_URL;
+}
 
 function connectionPath(target: string): string { return join(target, ".seamshield", "connection.json"); }
 
@@ -1194,7 +1210,7 @@ async function enrollSentinel(target: string, options: { apiUrl?: string; runtim
 async function observeSentinel(target: string, options: { apiUrl?: string; runtimeId?: string; environment?: string }): Promise<number> {
   const stored = readLocalConnection(target);
   const enrollment = readSentinelEnrollment(target);
-  const apiUrl = (options.apiUrl || process.env.SEAMSHIELD_API_URL || enrollment?.api_url || stored?.api_url || DEFAULT_CONNECTED_API_URL).replace(/\/$/, "");
+  const apiUrl = connectedApiUrl(options.apiUrl || process.env.SEAMSHIELD_API_URL, stored);
   const runtimeId = options.runtimeId || process.env.SEAMSHIELD_SENTINEL_RUNTIME_ID || enrollment?.runtime_id || "";
   const sentinelKey = process.env.SEAMSHIELD_SENTINEL_KEY || "";
   if (!runtimeId || !sentinelKey) {
@@ -1232,7 +1248,7 @@ async function observeSentinel(target: string, options: { apiUrl?: string; runti
 async function observeCloudflare(target: string, options: { apiUrl?: string; edgeAttachmentIds?: string[] }): Promise<number> {
   const stored = readLocalConnection(target);
   const enrollment = readSentinelEnrollment(target);
-  const apiUrl = (options.apiUrl || process.env.SEAMSHIELD_API_URL || enrollment?.api_url || stored?.api_url || DEFAULT_CONNECTED_API_URL).replace(/\/$/, "");
+  const apiUrl = connectedApiUrl(options.apiUrl || process.env.SEAMSHIELD_API_URL, stored);
   const sentinelKey = process.env.SEAMSHIELD_SENTINEL_KEY || "";
   const cloudflareToken = String(process.env.CLOUDFLARE_API_TOKEN || "").trim();
   const edgeAttachmentIds = options.edgeAttachmentIds?.length ? options.edgeAttachmentIds : String(process.env.SEAMSHIELD_SENTINEL_EDGE_ATTACHMENT_IDS || "").split(",").map((value) => value.trim()).filter(Boolean);
@@ -1556,7 +1572,7 @@ async function connectProject(target: string, options: { projectId?: string; tok
   const projectId = options.projectId || process.env.SEAMSHIELD_PROJECT_ID || stored?.project.id || "";
   const serverKey = process.env.SEAMSHIELD_SERVER_KEY || stored?.server_key || "";
   const connectionToken = options.token || "";
-  const apiUrl = (options.apiUrl || process.env.SEAMSHIELD_API_URL || stored?.api_url || DEFAULT_CONNECTED_API_URL).replace(/\/$/, "");
+  const apiUrl = connectedApiUrl(options.apiUrl || process.env.SEAMSHIELD_API_URL, stored);
   if (!connectionToken && (!projectId || (!serverKey && !options.ci))) {
     console.error("seamshield connect: run the one-time Platform connection command first");
     return 2;
@@ -2383,7 +2399,13 @@ function guardCheck(): void {
       return;
     }
     const tempRoot = mkdtempSync(join(tmpdir(), "seamshield-guard-"));
-    const abs = join(tempRoot, proposed.rel.replace(/^\/+/, ""));
+    const abs = resolve(tempRoot, proposed.rel);
+    const tempRelative = relative(tempRoot, abs);
+    if (!tempRelative || tempRelative.startsWith("..") || resolve(tempRoot, tempRelative) !== abs) {
+      rmSync(tempRoot, { recursive: true, force: true });
+      console.log(JSON.stringify(hookDeny("ss/guard/unsafe-file-path: proposed edit path must remain inside the Guard sandbox.")));
+      return;
+    }
     mkdirSync(dirname(abs), { recursive: true });
     writeFileSync(abs, proposed.content);
     const result = scan(tempRoot, { network: "off" });
