@@ -44,7 +44,7 @@ export function detectRepositoryCapabilities(files: WalkedFile[]): RepositoryCap
   const deepAccessLaneAdapters = [
     ...(frameworkIds.has("nextjs") ? ["nextjs"] : []),
     ...(frameworkIds.has("convex") ? ["convex"] : []),
-    ...(languageIds.has("javascript") || languageIds.has("typescript") ? ["generic-node-server"] : []),
+    ...(languageIds.has("javascript") || languageIds.has("typescript") ? ["generic-server"] : []),
   ];
   const dependencyEcosystems = [
     ...(languageIds.has("javascript") || languageIds.has("typescript") ? ["npm"] : []),

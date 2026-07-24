@@ -509,7 +509,8 @@ Secret evidence is redacted before findings, JSON, SARIF, and fix plans are
 emitted.
 
 `learn` is currently a no-upload stub. SeamShield does not auto-update or run
-untrusted community rules.
+untrusted community rules. Commercial packs must be explicitly verified with
+`rulepack verify` (or the `scan --rulepack-*` activation flags) before they run.
 
 ## Release Trust
 
@@ -521,5 +522,6 @@ npm install -g @seamshield/cli
 ```
 
 For release audits, use npm tarball integrity/checksum metadata and prefer the
-documented package entrypoint over forks or republished packages. Signed
-rulepack distribution is reserved for a future commercial/control-plane layer.
+documented package entrypoint over forks or republished packages. Commercial
+signed distribution remains a metadata-only control-plane custody workflow;
+this package never downloads or auto-activates an unverified pack.

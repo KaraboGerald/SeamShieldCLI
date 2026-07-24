@@ -1,8 +1,9 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { createHash, generateKeyPairSync, sign } from "node:crypto";
 import { afterAll, describe, expect, it } from "vitest";
-import { scan } from "../src/index.js";
+import { scan, verifyRulepack } from "../src/index.js";
 
 // Trigger strings are assembled from parts so the scanner never matches this
 // test file itself during self-scans.
@@ -33,6 +34,36 @@ function scanFiles(files: Record<string, string>): string[] {
 
 afterAll(() => {
   for (const dir of tempDirs) rmSync(dir, { recursive: true, force: true });
+});
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value && typeof value === "object") return `{${Object.entries(value as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b)).map(([key, item]) => `${JSON.stringify(key)}:${canonicalJson(item)}`).join(",")}}`;
+  return JSON.stringify(value);
+}
+
+function packDigest(rulesDir: string): string {
+  const name = "commercial.yaml";
+  const content = readFileSync(join(rulesDir, name), "utf8");
+  return createHash("sha256").update(name).update("\n").update(content).update("\n").digest("hex");
+}
+
+it("verifies signed commercial rulepacks and rejects tampering, tier, channel, and rollback mismatches", () => {
+  const root = mkdtempSync(join(tmpdir(), "seamshield-rulepack-")); tempDirs.push(root);
+  const rulesDir = join(root, "rules"); mkdirSync(rulesDir);
+  writeFileSync(join(rulesDir, "commercial.yaml"), `id: ss/pro/example\nseverity: warn\ntitle: Example\ndescription: Example rule\nframework_ref: example\ncheck:\n  type: regex\n  patterns:\n    - name: example\n      regex: example\nfix:\n  summary: Fix\n  agent_prompt: Fix it\n`);
+  const keys = generateKeyPairSync("ed25519");
+  const unsigned = { schema: "seamshield.rulepack-manifest/v1", tier: "pro", channel: "stable", version: "2026.07.24", rules_digest: packDigest(rulesDir), previous_rules_digest: "previous", signing_key_id: "test-key" };
+  const manifest = { ...unsigned, signature: sign(null, Buffer.from(canonicalJson(unsigned)), keys.privateKey).toString("base64url") };
+  const manifestPath = join(root, "manifest.json"); writeFileSync(manifestPath, JSON.stringify(manifest));
+  const options = { rulesDir, manifestPath, publicKey: keys.publicKey.export({ type: "spki", format: "pem" }).toString(), entitlementTier: "pro" as const, allowedChannels: ["stable"] as const, previousRulesDigest: "previous" };
+  expect(verifyRulepack(options).manifest.version).toBe("2026.07.24");
+  expect(scan(root, { rulesDir, rulepack: options }).rulesLoaded).toBe(1);
+  expect(() => verifyRulepack({ ...options, entitlementTier: "enterprise" })).toThrow("rulepack_entitlement_mismatch");
+  expect(() => verifyRulepack({ ...options, allowedChannels: ["preview"] })).toThrow("rulepack_channel_not_allowed");
+  expect(() => verifyRulepack({ ...options, previousRulesDigest: "other" })).toThrow("rulepack_rollback_lineage_mismatch");
+  writeFileSync(join(rulesDir, "commercial.yaml"), "tampered\n");
+  expect(() => verifyRulepack(options)).toThrow("rulepack_digest_mismatch");
 });
 
 interface Case {

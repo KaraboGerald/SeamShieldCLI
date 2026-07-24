@@ -9,6 +9,7 @@ export {
 export { buildFinding, isSuppressed, runRegexRule } from "./engine.js";
 export { checkConvexPublicFunctions, checkConvexTenantBoundWrites } from "./convexAdapter.js";
 export { detectRepositoryCapabilities } from "./capabilities.js";
+export { CoverageContractSchema, parseCoverageContract, type CoverageContract } from "./coverageContract.js";
 export { checkEnvFileCommitted } from "./envFileCommitted.js";
 export { buildFixPlan, writeFixPlan, writeMarkdownFixPlan, type FixPlanAgent } from "./fixPlan.js";
 export {
@@ -19,7 +20,7 @@ export {
 } from "./inventory.js";
 export { renderInvestigationMarkdown, writeInvestigationMarkdown } from "./investigation.js";
 export { buildTestPlan, writeTestPlan, type TestPlanAgent } from "./testPlan.js";
-export { loadRules, type LoadedRules } from "./loadRules.js";
+export { loadRules, verifyRulepack, type LoadedRules, type RulepackManifest, type VerifiedRulepack, type CommercialRulepackTier, type RulepackChannel } from "./loadRules.js";
 export { fileMatchesRule, matchBasenamePattern } from "./matchers.js";
 export { redactSecret } from "./redact.js";
 export { renderJson } from "./reporters/json.js";

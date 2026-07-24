@@ -106,6 +106,13 @@ export type ScanProfile = "community" | "workspace" | "incident";
 
 export interface ScanOptions {
   rulesDir?: string;
+  rulepack?: {
+    manifestPath: string;
+    publicKey: string;
+    entitlementTier: "pro" | "enterprise";
+    allowedChannels: readonly ("stable" | "preview" | "security")[];
+    previousRulesDigest?: string;
+  };
   failOn?: FailOn;
   network?: "on" | "off";
   fetchImpl?: typeof fetch;

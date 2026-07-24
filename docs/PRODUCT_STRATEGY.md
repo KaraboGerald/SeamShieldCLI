@@ -41,8 +41,10 @@ Enterprise on usage-based terms.
 
 **SeamShield Learn** converts CVEs, breaches, advisories, and abuse patterns
 into local controls, guard rules, fix plans, and runtime decision rules. The
-Community CLI exposes `learn` only as a local/no-upload stub until signed
-rulepack distribution is intentionally added.
+Community CLI exposes `learn` only as a local/no-upload stub. Commercial local
+packs require an explicit signed manifest, trusted public key, entitlement,
+channel, digest, and rollback-lineage verification before activation; the
+hosted control plane records only distribution and rotation custody metadata.
 
 **SeamShield Console** is the local, self-hosted, or enterprise control surface
 for access maps, guard decisions, runtime trails, suppressions, policies,

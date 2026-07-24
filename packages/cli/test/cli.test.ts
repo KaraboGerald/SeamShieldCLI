@@ -48,6 +48,7 @@ describe("seamshield scan (built CLI)", () => {
     expect(result.stdout).toContain("connect [options] [path]");
     expect(result.stdout).toContain("sync [options] [path]");
     expect(result.stdout).toContain("deploy-gate");
+    expect(result.stdout).toContain("rulepack");
   });
 
   it("covers the Community provider fixtures", () => {
@@ -558,6 +559,24 @@ describe("seamshield scan (built CLI)", () => {
     expect(readFileSync(join(circle, ".circleci", "config.yml"), "utf8")).toContain("SEAMSHIELD_CI_PROVIDER: circleci");
   });
 
+  it("does not let repo-local connection state redirect CI credentials", () => {
+    const dir = tempProject();
+    spawnSync("git", ["init"], { cwd: dir });
+    spawnSync("git", ["remote", "add", "origin", "https://github.com/acme/widget.git"], { cwd: dir });
+    mkdirSync(join(dir, ".seamshield"), { recursive: true });
+    writeFileSync(join(dir, ".seamshield", "connection.json"), `${JSON.stringify({
+      schema: "seamshield.local-connection/v1",
+      project: { id: "project_paid", name: "Paid project" },
+      api_url: "https://attacker.invalid/api",
+      source_upload: false,
+    })}\n`);
+
+    expect(runCli(["ci", "install", dir, "--provider", "github"]).status).toBe(0);
+    const workflow = readFileSync(join(dir, ".github", "workflows", "seamshield.yml"), "utf8");
+    expect(workflow).toContain("SEAMSHIELD_API_URL: https://platform.seamshield.com/api");
+    expect(workflow).not.toContain("attacker.invalid");
+  });
+
   it("exposes the one-time repository connection token flow", () => {
     const result = runCli(["connect", "--help"]);
     expect(result.status).toBe(0);
@@ -754,10 +773,19 @@ describe("seamshield scan (built CLI)", () => {
     const missing = JSON.parse(before.stdout) as {
       schema: string;
       status: string;
+      enforcement_agents: string[];
+      advisory_context_agents: string[];
+      agent_support: Array<{ agent: string; mode: string; state: string }>;
       checks: { pre_tool_use_hook_installed: boolean; claude_settings_exists: boolean };
     };
     expect(missing.schema).toBe("seamshield.guard-status/v1");
     expect(missing.status).toBe("not_installed");
+    expect(missing.enforcement_agents).toEqual(["claude"]);
+    expect(missing.advisory_context_agents).toContain("codex");
+    expect(missing.agent_support).toEqual(expect.arrayContaining([
+      expect.objectContaining({ agent: "claude", mode: "write_interception", state: "not_installed" }),
+      expect.objectContaining({ agent: "codex", mode: "advisory_context", state: "not_enforced" }),
+    ]));
     expect(missing.checks.claude_settings_exists).toBe(false);
     expect(missing.checks.pre_tool_use_hook_installed).toBe(false);
 
@@ -766,6 +794,8 @@ describe("seamshield scan (built CLI)", () => {
     expect(after.status).toBe(0);
     expect(after.stdout).toContain("SeamShield Guard Status");
     expect(after.stdout).toContain("Status: installed");
+    expect(after.stdout).toContain("Write-interception agents: claude");
+    expect(after.stdout).toContain("Advisory-context-only agents: cursor, codex");
     expect(after.stdout).toContain("PreToolUse hook: installed");
     expect(after.stdout).toContain("Matcher: Write|Edit|MultiEdit|Bash");
     expect(runCli(["guard", "status", dir, "--format", "xml"]).status).toBe(2);
@@ -792,14 +822,16 @@ describe("seamshield scan (built CLI)", () => {
   });
 
   it("denies Guard paths that escape its temporary sandbox", () => {
+    const proof = join(tmpdir(), `seamshield-guard-escape-${Date.now()}.txt`);
     const input = JSON.stringify({
       tool_name: "Write",
-      tool_input: { file_path: "../../outside.ts", content: "export const safe = true;\n" },
+      tool_input: { file_path: `../../${proof.slice(1)}`, content: "export const safe = true;\n" },
     });
     const result = runCliWithInput(["guard", "check"], input);
     expect(result.status).toBe(0);
     const parsed = JSON.parse(result.stdout) as { hookSpecificOutput: { permissionDecision?: string; permissionDecisionReason?: string } };
     expect(parsed.hookSpecificOutput.permissionDecision).toBe("deny");
     expect(parsed.hookSpecificOutput.permissionDecisionReason).toContain("ss/guard/unsafe-file-path");
+    expect(existsSync(proof)).toBe(false);
   });
 });

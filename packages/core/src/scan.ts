@@ -10,7 +10,7 @@ import { checkNextServerActionTrustedClient } from "./nextAdapter.js";
 import { checkNoLockfile, checkPackageManagerDrift } from "./noLockfile.js";
 import { checkServerGroupedRouters, checkWebhookSignatureBoundary } from "./serverAdapter.js";
 import { checkVercelConfig } from "./vercelAdapter.js";
-import { loadRules } from "./loadRules.js";
+import { loadRules, verifyRulepack } from "./loadRules.js";
 import {
   SEVERITY_RANK,
   type FailOn,
@@ -25,9 +25,14 @@ const corePkg = JSON.parse(
   readFileSync(new URL("../package.json", import.meta.url), "utf8"),
 ) as { version: string };
 
+function activeRules(options: ScanOptions) {
+  const rulesDir = options.rulesDir ?? defaultRulesDir;
+  return options.rulepack ? verifyRulepack({ rulesDir, ...options.rulepack }) : loadRules(rulesDir);
+}
+
 export function scan(target: string, options: ScanOptions = {}): ScanResult {
   const root = resolve(target);
-  const { rules, policyBundleDigest } = loadRules(options.rulesDir ?? defaultRulesDir);
+  const { rules, policyBundleDigest } = activeRules(options);
   const config = loadConfig(root);
   const ctx: ScanContext = { root, policyBundleDigest, engineVersion: corePkg.version };
 
@@ -112,7 +117,7 @@ export async function scanAsync(target: string, options: ScanOptions = {}): Prom
   if (options.network === "off") return result;
 
   const root = resolve(target);
-  const { rules } = loadRules(options.rulesDir ?? defaultRulesDir);
+  const { rules } = activeRules(options);
   const config = loadConfig(root);
   const ctx: ScanContext = {
     root,

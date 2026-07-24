@@ -26,6 +26,7 @@ import {
   renderTable,
   scan,
   scanAsync,
+  verifyRulepack,
   writeInvestigationMarkdown,
   writeMarkdownFixPlan,
   writeTestPlan,
@@ -195,7 +196,7 @@ function buildPrivacyReport(target: string) {
     ],
     rule_updates: {
       automatic_untrusted_updates: false,
-      learn_command: "local/no-upload stub until signed rulepack support is intentionally added",
+      learn_command: "local/no-upload stub; signed commercial rulepacks require explicit rulepack verify or scan --rulepack-* activation",
     },
     commercial_boundary: {
       pro: "advanced controls, CVE-to-control updates, premium adapters, advanced guard rules, advanced fix plans, local premium rulepacks, SeamShield Auth up to 100k MAU",
@@ -665,7 +666,7 @@ function renderAuditTable(report: ReturnType<typeof buildAuditBundle>): string {
 
 async function runScan(
   path: string,
-  opts: { format: string; failOn: string; offline?: boolean; investigation?: boolean; profile?: string; root?: string[] },
+  opts: { format: string; failOn: string; offline?: boolean; investigation?: boolean; profile?: string; root?: string[]; rulesDir?: string; rulepackManifest?: string; rulepackPublicKey?: string; rulepackTier?: string; rulepackChannel?: string[]; rulepackPreviousDigest?: string },
 ) {
   if (!assertOptions(opts)) return;
   if (!assertProfile(opts.profile, opts.root ?? [])) return;
@@ -676,10 +677,14 @@ async function runScan(
     return;
   }
   try {
+    const commercial = opts.rulepackManifest || opts.rulepackPublicKey || opts.rulepackTier;
+    if (commercial && (!opts.rulesDir || !opts.rulepackManifest || !opts.rulepackPublicKey || !["pro", "enterprise"].includes(opts.rulepackTier || ""))) throw new Error("commercial scans require --rules-dir, --rulepack-manifest, --rulepack-public-key, and --rulepack-tier pro|enterprise");
     const result = await scanAsync(target, {
       failOn: opts.failOn as FailOn,
       network: opts.offline ? "off" : "on",
       profile: (opts.profile as ScanProfile | undefined) ?? "community",
+      rulesDir: opts.rulesDir ? resolve(opts.rulesDir) : undefined,
+      rulepack: commercial ? { manifestPath: resolve(opts.rulepackManifest!), publicKey: readFileSync(resolve(opts.rulepackPublicKey!), "utf8"), entitlementTier: opts.rulepackTier as "pro" | "enterprise", allowedChannels: (opts.rulepackChannel || ["stable"]) as Array<"stable" | "preview" | "security">, previousRulesDigest: opts.rulepackPreviousDigest } : undefined,
     });
     maybeWriteInvestigation(result, opts.investigation);
     console.log(render(opts.format, result));
@@ -1149,7 +1154,7 @@ function installSentinelSchedule(target: string): number {
   if (!existsSync(envPath)) {
     writeFileSync(envPath, [
       "# Keep this file mode 0600. Values stay on this host and are never committed.",
-      `SEAMSHIELD_API_URL=${enrollment?.api_url || stored?.api_url || process.env.SEAMSHIELD_API_URL || DEFAULT_CONNECTED_API_URL}`,
+      `SEAMSHIELD_API_URL=${connectedApiUrl(process.env.SEAMSHIELD_API_URL, stored)}`,
       `SEAMSHIELD_SENTINEL_RUNTIME_ID=${runtimeId}`,
       "SEAMSHIELD_SENTINEL_KEY=",
       "# Optional: enables the local Cloudflare edge collector.",
@@ -2290,10 +2295,20 @@ function buildGuardStatus(target: string) {
     : preToolUse.length > 0 ? "custom" : "missing";
   const currentBinaryReferenced = commandText.includes(currentBin());
   const policy = readJsonFile(guardPolicyPath(root));
+  const agent_support = CONTEXT_AGENTS.map((agent) => ({
+    agent,
+    mode: agent === "claude" ? "write_interception" : "advisory_context",
+    state: agent === "claude" ? (installed ? "enforced" : "not_installed") : "not_enforced",
+    evidence: agent === "claude"
+      ? ".claude/settings.json PreToolUse hook"
+      : `${agentContextPath(root, agent)} instructions only`,
+  }));
   return {
     schema: "seamshield.guard-status/v1",
     target: root,
-    supported_agents: ["claude"],
+    enforcement_agents: ["claude"],
+    advisory_context_agents: CONTEXT_AGENTS.filter((agent) => agent !== "claude"),
+    agent_support,
     checks: {
       claude_settings_exists: existsSync(settingsPath),
       claude_settings_parseable: settings !== null,
@@ -2306,7 +2321,7 @@ function buildGuardStatus(target: string) {
     status: installed ? "installed" : "not_installed",
     next: installed
       ? "Run `seamshield guard check` through the configured Claude Code hook event."
-      : "Run `seamshield guard install .` to add the Claude Code PreToolUse hook.",
+      : "Run `seamshield guard install .` to add the only supported write-interception hook: Claude Code PreToolUse.",
   };
 }
 
@@ -2316,7 +2331,8 @@ function renderGuardStatusTable(status: ReturnType<typeof buildGuardStatus>): st
     "",
     `Target: ${status.target}`,
     `Status: ${status.status}`,
-    `Supported agents: ${status.supported_agents.join(", ")}`,
+    `Write-interception agents: ${status.enforcement_agents.join(", ")}`,
+    `Advisory-context-only agents: ${status.advisory_context_agents.join(", ")}`,
     "",
     `Claude settings: ${status.checks.claude_settings_exists ? "found" : "missing"}`,
     `Settings parseable: ${status.checks.claude_settings_parseable ? "yes" : "no"}`,
@@ -2496,9 +2512,42 @@ program
   .option("--offline", "skip npm registry and OSV network checks")
   .option("--no-investigation", "do not write .seamshield/investigations/*.md")
   .option("--profile <profile>", "scan profile: community | workspace | incident", "community")
+  .option("--rules-dir <path>", "signed commercial rule directory (requires rulepack contract)")
+  .option("--rulepack-manifest <path>", "signed commercial rulepack manifest JSON")
+  .option("--rulepack-public-key <path>", "Ed25519 public key PEM path")
+  .option("--rulepack-tier <tier>", "commercial entitlement: pro | enterprise")
+  .option("--rulepack-channel <channel...>", "allowed rulepack channels", ["stable"])
+  .option("--rulepack-previous-digest <digest>", "active prior rules digest required by the manifest")
   .option("--root <path>", "explicit root for workspace or incident profiles", collectRoot, [])
-  .action((path: string, opts: { format: string; failOn: string; offline?: boolean; investigation?: boolean; profile?: string; root?: string[] }) => {
+  .action((path: string, opts: { format: string; failOn: string; offline?: boolean; investigation?: boolean; profile?: string; root?: string[]; rulesDir?: string; rulepackManifest?: string; rulepackPublicKey?: string; rulepackTier?: string; rulepackChannel?: string[]; rulepackPreviousDigest?: string }) => {
     return runScan(path, opts);
+  });
+
+const rulepack = program
+  .command("rulepack")
+  .description("Verify signed Pro or Enterprise rulepacks before local activation");
+
+rulepack
+  .command("verify")
+  .description("Verify manifest signature, rules digest, tier, channel, and rollback lineage")
+  .requiredOption("--rules-dir <path>", "directory containing commercial YAML rules")
+  .requiredOption("--manifest <path>", "signed rulepack manifest JSON")
+  .requiredOption("--public-key <pem>", "Ed25519 public key PEM path")
+  .requiredOption("--tier <tier>", "entitled tier: pro | enterprise")
+  .option("--channel <channel...>", "allowed channels: stable | preview | security", ["stable"])
+  .option("--previous-digest <digest>", "required digest of the active prior pack")
+  .action((opts: { rulesDir: string; manifest: string; publicKey: string; tier: string; channel: string[]; previousDigest?: string }) => {
+    try {
+      if (!["pro", "enterprise"].includes(opts.tier)) throw new Error("--tier must be pro or enterprise");
+      const allowed = opts.channel || ["stable"];
+      if (allowed.some((channel) => !["stable", "preview", "security"].includes(channel))) throw new Error("invalid_rulepack_channel");
+      const result = verifyRulepack({ rulesDir: resolve(opts.rulesDir), manifestPath: resolve(opts.manifest), publicKey: readFileSync(resolve(opts.publicKey), "utf8"), entitlementTier: opts.tier as "pro" | "enterprise", allowedChannels: allowed as Array<"stable" | "preview" | "security">, previousRulesDigest: opts.previousDigest });
+      console.log(`${JSON.stringify({ schema: "seamshield.rulepack-verification/v1", status: "verified", tier: result.manifest.tier, channel: result.manifest.channel, version: result.manifest.version, rules_digest: result.policyBundleDigest, signing_key_id: result.manifest.signing_key_id, source_upload: false }, null, 2)}\n`);
+      process.exitCode = 0;
+    } catch (error) {
+      console.error(`seamshield: rulepack verification failed: ${error instanceof Error ? error.message : String(error)}`);
+      process.exitCode = 2;
+    }
   });
 
 program
@@ -2931,7 +2980,7 @@ program
 
 const guard = program
   .command("guard")
-  .description("Claude Code guard utilities");
+  .description("Guard utilities (Claude Code write interception; other agents receive advisory context only)");
 
 guard
   .command("check")
@@ -3006,7 +3055,11 @@ ci
       process.exitCode = 0;
     } else {
       const plan = buildCiPlan(target, { ciProvider: opts.provider, ciRepositoryId: opts.repositoryId, ciIssuer: opts.issuer, ciJwksUri: opts.jwksUri, ciAudience: opts.audience });
-      const installed = installCiAutomation(target, { projectId: connection.project.id, apiUrl: connection.api_url, provider: plan.provider }, plan);
+      const installed = installCiAutomation(target, {
+        projectId: connection.project.id,
+        apiUrl: connectedApiUrl(process.env.SEAMSHIELD_API_URL, connection),
+        provider: plan.provider,
+      }, plan);
       console.log(installed.status === "configured" ? `${installed.provider}: configured` : installed.reason || `${installed.provider}: setup required`);
       process.exitCode = installed.status === "configured" ? 0 : 2;
     }
