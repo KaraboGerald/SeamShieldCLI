@@ -1891,8 +1891,37 @@ async function exchangeCiCredential(apiUrl: string, projectId: string, provider:
     body: JSON.stringify({ provider, id_token: idToken, observation }),
   });
   const body = await response.json().catch(() => ({})) as { access_token?: string; error?: string };
-  if (!response.ok || !body.access_token) throw new Error(String(body.error || `CI identity exchange failed (${response.status})`));
+  if (!response.ok || !body.access_token) {
+    // A missing trust anchor is the single most common first-run failure, and
+    // the bare provider error named neither the cause nor the fix. Projects
+    // provisioned outside `connect` (for example from the Console) have no
+    // binding at all, so say exactly which command creates one.
+    if (String(body.error || "") === "ci_binding_not_found" || response.status === 404) {
+      throw new Error(`this project has no ${provider} OIDC trust anchor, so CI cannot prove its identity. Run \`seamshield ci install .\` locally with SEAMSHIELD_SERVER_KEY set (or \`seamshield connect . --token ssconn_...\`) to bind the repository once, then re-run this job.`);
+    }
+    throw new Error(String(body.error || `CI identity exchange failed (${response.status})`));
+  }
   return body.access_token;
+}
+
+// `ci install` writes a workflow that authenticates purely through provider
+// OIDC, which only works once the project has a trust anchor bound to this
+// repository. Console-provisioned projects never went through `connect`, so
+// the workflow installed cleanly, reported every check green, and then failed
+// its first run. Bind here whenever the operator holds the project server key.
+async function bindCiTrustAnchor(apiUrl: string, projectId: string, serverKey: string, binding: CiBinding): Promise<{ bound: boolean; detail: string }> {
+  try {
+    const response = await fetch(`${apiUrl}/v1/projects/${encodeURIComponent(projectId)}/ci/bind`, {
+      method: "POST",
+      headers: { "content-type": "application/json", accept: "application/json", "x-seamshield-server-key": serverKey },
+      body: JSON.stringify(binding),
+    });
+    const body = await response.json().catch(() => ({})) as { ci_binding_receipt?: { digest?: string }; error?: string; detail?: string };
+    if (response.ok && body.ci_binding_receipt?.digest) return { bound: true, detail: body.ci_binding_receipt.digest };
+    return { bound: false, detail: String(body.detail || body.error || `ci_bind_${response.status}`) };
+  } catch (error) {
+    return { bound: false, detail: error instanceof Error ? error.message : String(error) };
+  }
 }
 
 function requireReceiptDigest(value: unknown, label: string): string {
@@ -3918,7 +3947,7 @@ ci
   .option("--issuer <url>", "provider OIDC issuer")
   .option("--jwks-uri <url>", "provider OIDC JWKS endpoint")
   .option("--audience <audience>", "provider OIDC audience")
-  .action((path: string, opts: { provider?: string; repositoryId?: string; issuer?: string; jwksUri?: string; audience?: string }) => {
+  .action(async (path: string, opts: { provider?: string; repositoryId?: string; issuer?: string; jwksUri?: string; audience?: string }) => {
     const target = resolve(path);
     if (!existsSync(target)) {
       console.error(`seamshield: path not found: ${path}`);
@@ -3947,6 +3976,27 @@ ci
         provider: plan.provider,
       }, plan);
       console.log(installed.status === "configured" ? `${installed.provider}: configured` : installed.reason || `${installed.provider}: setup required`);
+      if (installed.status === "configured" && plan.binding) {
+        // The workflow authenticates only through provider OIDC, so installing
+        // it without a trust anchor produces a pipeline that looks fully
+        // configured and then fails its first run. Bind now while the server
+        // key is in hand rather than leaving a green status that lies.
+        const apiUrl = connectedApiUrl(process.env.SEAMSHIELD_API_URL, connection);
+        const serverKey = runtimeServerKey() || connection.server_key || "";
+        if (!serverKey) {
+          console.error(`seamshield ci install: no ${plan.provider} OIDC trust anchor could be bound because no project server key is available. CI will fail with ci_binding_not_found until you re-run this with SEAMSHIELD_SERVER_KEY set.`);
+          process.exitCode = 2;
+          return;
+        }
+        const anchor = await bindCiTrustAnchor(apiUrl, connection.project.id, serverKey, plan.binding);
+        if (anchor.bound) {
+          console.log(`${plan.provider} OIDC trust anchor bound to ${plan.binding.repository} (receipt ${anchor.detail.slice(0, 18)})`);
+        } else {
+          console.error(`seamshield ci install: the workflow was written but the ${plan.provider} OIDC trust anchor was not bound: ${anchor.detail}`);
+          process.exitCode = 2;
+          return;
+        }
+      }
       process.exitCode = installed.status === "configured" ? 0 : 2;
     }
   });
