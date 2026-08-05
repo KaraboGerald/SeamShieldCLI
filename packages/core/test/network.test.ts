@@ -61,4 +61,23 @@ describe("network dependency rules", () => {
     expect(result.findings.filter((f) => f.finding.rule_id.startsWith("ss/deps/"))).toEqual([]);
     expect(result.networkSkipped).toBe(false);
   });
+
+  it("ignores workspace:, file:, and link: dependencies without hitting the network", async () => {
+    const dir = makeProject({
+      dependencies: {
+        "@seamshield/core": "workspace:*",
+        "local-pkg": "file:../local-pkg",
+        "linked-pkg": "link:../linked-pkg",
+      },
+    });
+    let fetched = false;
+    const fetchImpl = (async () => {
+      fetched = true;
+      return Response.json({});
+    }) as typeof fetch;
+    const result = await scanAsync(dir, { fetchImpl, networkTimeoutMs: 50 });
+    const hallucinated = result.findings.filter((f) => f.finding.rule_id === "ss/deps/hallucinated-package");
+    expect(hallucinated).toEqual([]);
+    expect(fetched).toBe(false);
+  });
 });

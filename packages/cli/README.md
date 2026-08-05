@@ -27,6 +27,10 @@ seamshield ship .
 
 Requires Node.js 20 or newer.
 
+To connect a paid project end to end (Build, CI, deployment gate, SeamAuth,
+and Sentinel), follow `docs/CONNECT_EVERYTHING.md`. Verify any setup with
+`seamshield doctor . --connected`.
+
 ## Repository Coverage
 
 SeamShield runs baseline local controls on every repository, regardless of the

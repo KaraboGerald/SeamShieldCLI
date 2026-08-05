@@ -1,4 +1,5 @@
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import { createServer } from "node:http";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -26,6 +27,26 @@ function runCliEnv(args: string[], env: Record<string, string>) {
 
 function runCliWithInput(args: string[], input: string) {
   return spawnSync(process.execPath, [cliPath, ...args], { encoding: "utf8", input });
+}
+
+function runCliWithInputIn(cwd: string, args: string[], input: string) {
+  return spawnSync(process.execPath, [cliPath, ...args], { encoding: "utf8", input, cwd });
+}
+
+// spawnSync blocks this process's event loop, so an in-process stub server can
+// never accept the CLI's request. Anything that talks to a local server must
+// use the async form.
+function runCliEnvAsync(args: string[], env: Record<string, string>): Promise<{ status: number | null; stdout: string; stderr: string }> {
+  return new Promise((resolveRun) => {
+    const child = spawn(process.execPath, [cliPath, ...args], { env: { ...process.env, ...env } });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => { stdout += chunk; });
+    child.stderr.on("data", (chunk) => { stderr += chunk; });
+    child.on("close", (status) => resolveRun({ status, stdout, stderr }));
+  });
 }
 
 const tempDirs: string[] = [];
@@ -424,6 +445,98 @@ describe("seamshield scan (built CLI)", () => {
     expect(existsSync(join(dir, ".seamshield", "investigations"))).toBe(true);
   });
 
+  it("applies the signed project Guard policy at enforcement time", () => {
+    const dir = tempProject();
+    mkdirSync(join(dir, ".seamshield"), { recursive: true });
+    const edit = JSON.stringify({
+      tool_name: "Write",
+      tool_input: {
+        file_path: "convex/messages.ts",
+        content: 'import { mutation } from "./_generated/server";\n\nexport const send = mutation({\n  handler: async (ctx, { body }) => {\n    await ctx.db.insert("messages", { body });\n  },\n});\n',
+      },
+    });
+
+    // Without a cached policy the bundled scanner only warns on this lane.
+    const noPolicy = runCliWithInputIn(dir, ["guard", "check"], edit);
+    expect(noPolicy.status).toBe(0);
+    expect(noPolicy.stdout).not.toContain("deny");
+
+    writeFileSync(join(dir, ".seamshield", "guard-policy.json"), `${JSON.stringify({
+      schema: "seamshield.guard-policy/v1",
+      project_id: "project_policy",
+      version: "community-core",
+      digest: "signed-digest",
+      controls: { block: ["anonymous_write"], warn: ["wildcard_cors_with_credentials"] },
+    })}\n`);
+
+    const enforced = runCliWithInputIn(dir, ["guard", "check"], edit);
+    expect(enforced.status).toBe(0);
+    const parsed = JSON.parse(enforced.stdout) as { hookSpecificOutput?: { permissionDecision?: string; permissionDecisionReason?: string } };
+    expect(parsed.hookSpecificOutput?.permissionDecision).toBe("deny");
+    expect(parsed.hookSpecificOutput?.permissionDecisionReason).toContain("anonymous_write");
+    expect(parsed.hookSpecificOutput?.permissionDecisionReason).toContain("community-core");
+  }, 20_000);
+
+  it("spools guard decisions as metadata without leaking the edited path", () => {
+    const dir = tempProject();
+    mkdirSync(join(dir, ".seamshield"), { recursive: true });
+    writeFileSync(join(dir, ".seamshield", "guard-policy.json"), `${JSON.stringify({
+      schema: "seamshield.guard-policy/v1",
+      project_id: "project_policy",
+      version: "community-core",
+      digest: "signed-digest",
+      controls: { block: ["anonymous_write"], warn: [] },
+    })}\n`);
+    const edit = JSON.stringify({
+      tool_name: "Write",
+      tool_input: {
+        file_path: "convex/messages.ts",
+        content: 'import { mutation } from "./_generated/server";\n\nexport const send = mutation({\n  handler: async (ctx, { body }) => {\n    await ctx.db.insert("messages", { body });\n  },\n});\n',
+      },
+    });
+
+    const denied = runCliWithInputIn(dir, ["guard", "check"], edit);
+    expect(denied.status).toBe(0);
+
+    const spool = join(dir, ".seamshield", "guard-decisions.jsonl");
+    expect(existsSync(spool)).toBe(true);
+    const raw = readFileSync(spool, "utf8");
+    const record = JSON.parse(raw.trim().split("\n").at(-1) as string) as Record<string, unknown>;
+    expect(record.decision).toBe("deny");
+    expect(record.risk).toBe("anonymous_write");
+    expect(record.path_extension).toBe(".ts");
+    expect(String(record.path_hash)).toMatch(/^[a-f0-9]{32}$/);
+    // The spool is uploaded verbatim, so the path and the proposed content
+    // must never appear in it.
+    expect(raw).not.toContain("convex/messages.ts");
+    expect(raw).not.toContain("ctx.db.insert");
+  }, 20_000);
+
+  it("preserves unrelated Claude Code hooks when installing Guard", () => {
+    const dir = tempProject();
+    mkdirSync(join(dir, ".claude"), { recursive: true });
+    writeFileSync(join(dir, ".claude", "settings.json"), `${JSON.stringify({
+      hooks: {
+        PreToolUse: [{ matcher: "Read", hooks: [{ type: "command", command: "echo project-owned-hook" }] }],
+      },
+    }, null, 2)}\n`);
+
+    expect(runCli(["guard", "install", dir]).status).toBe(0);
+    const settings = JSON.parse(readFileSync(join(dir, ".claude", "settings.json"), "utf8")) as {
+      hooks: { PreToolUse: Array<{ matcher: string; hooks: Array<{ command: string }> }> };
+    };
+    expect(settings.hooks.PreToolUse).toHaveLength(2);
+    expect(settings.hooks.PreToolUse[0]?.hooks[0]?.command).toBe("echo project-owned-hook");
+    expect(JSON.stringify(settings.hooks.PreToolUse[1])).toContain("guard check");
+
+    // Reinstalling must stay idempotent rather than stacking SeamShield hooks.
+    expect(runCli(["guard", "install", dir]).status).toBe(0);
+    const again = JSON.parse(readFileSync(join(dir, ".claude", "settings.json"), "utf8")) as {
+      hooks: { PreToolUse: unknown[] };
+    };
+    expect(again.hooks.PreToolUse).toHaveLength(2);
+  });
+
   it("initializes a repo with opt-outs", () => {
     const dir = tempProject();
     const result = runCli(["init", dir, "--no-agent-context", "--no-guard", "--no-ci"]);
@@ -577,6 +690,42 @@ describe("seamshield scan (built CLI)", () => {
     expect(workflow).not.toContain("attacker.invalid");
   });
 
+  it("emits deployment-gate host secrets instead of making them hand-copied", () => {
+    const dir = tempProject();
+    mkdirSync(join(dir, ".seamshield"), { recursive: true });
+    writeFileSync(join(dir, ".seamshield", "connection.json"), `${JSON.stringify({
+      schema: "seamshield.local-connection/v1",
+      project: { id: "project_gate", name: "Gate project" },
+      api_url: "https://platform.seamshield.com/api",
+      server_key: "ssrk_gate_secret_value",
+      source_upload: false,
+    })}\n`);
+
+    // Default output is safe to paste into a terminal: the private key is
+    // withheld until it is explicitly requested.
+    const withheld = runCli(["deploy-gate", "env", dir]);
+    expect(withheld.status).toBe(0);
+    expect(withheld.stdout).toContain("export SEAMSHIELD_PROJECT_ID='project_gate'");
+    expect(withheld.stdout).toContain("export SEAMSHIELD_API_URL='https://platform.seamshield.com/api'");
+    expect(withheld.stdout).not.toContain("ssrk_gate_secret_value");
+
+    // The CLI already resolves the key for `deploy-gate verify`; refusing to
+    // emit it is what forced hosts to open connection.json by hand.
+    const revealed = runCli(["deploy-gate", "env", dir, "--reveal"]);
+    expect(revealed.status).toBe(0);
+    expect(revealed.stdout).toContain("export SEAMSHIELD_SERVER_KEY='ssrk_gate_secret_value'");
+
+    const json = runCli(["deploy-gate", "env", dir, "--format", "json", "--reveal"]);
+    expect(json.status).toBe(0);
+    expect(JSON.parse(json.stdout).SEAMSHIELD_SERVER_KEY).toBe("ssrk_gate_secret_value");
+
+    // Without a stored connection it must fail loudly, not print a half-usable
+    // set of exports that silently omits the credential.
+    const unconnected = runCli(["deploy-gate", "env", tempProject()]);
+    expect(unconnected.status).toBe(2);
+    expect(unconnected.stderr).toContain("no stored deployment-gate credential");
+  }, 20_000);
+
   it("exposes the one-time repository connection token flow", () => {
     const result = runCli(["connect", "--help"]);
     expect(result.status).toBe(0);
@@ -603,7 +752,9 @@ describe("seamshield scan (built CLI)", () => {
     expect(source).toContain("branch_protection_present");
     expect(source).toContain("workflow_present");
     expect(source).toContain("duration_ms: Date.now() - startedAt");
-    expect(source).toContain('filter((lane) => lane.severity === "block")');
+    expect(source).toContain('filter((lane) => lane.severity === "critical")');
+    expect(source).toContain("function projectionSeverity(severity: string): string");
+    expect(source).toContain('critical: access.summary.by_severity.block || 0');
     expect(source).toContain(".command(\"sync\")");
     expect(source).toContain("/agent/jobs");
     expect(source).toContain("/ci/bind");
@@ -634,6 +785,185 @@ describe("seamshield scan (built CLI)", () => {
     expect(invalidEnrollment.status).toBe(2);
     expect(invalidEnrollment.stderr).toContain("opaque runtime id");
   });
+
+  it("parses ss listener output that carries a trailing peer column", () => {
+    // The original parser anchored the port to end-of-line (`/:(\d+)\s*$/gm`).
+    // Real `ss -H -ltn` output always prints a peer address after the local
+    // address, so that pattern matched nothing and the collector reported a
+    // successful observation with zero services on a fully discoverable host.
+    const source = readFileSync(new URL("../src/index.ts", import.meta.url), "utf8");
+    expect(source).toContain("function parseSsListeners");
+    expect(source).not.toContain("parse: (output) => [...output.matchAll(/:(\\d+)\\s*$/gm)]");
+    // A collector that runs but sees nothing must not submit an empty receipt.
+    expect(source).toContain("collector_saw_no_listeners");
+    expect(source).toContain("SEAMSHIELD_SENTINEL_ALLOW_EMPTY");
+    expect(source).toContain("--network host --pid host");
+  });
+
+  it("preflights every Sentinel precondition without recording an observation", () => {
+    const help = runCli(["sentinel", "preflight", "--help"]);
+    expect(help.status).toBe(0);
+    expect(help.stdout).toContain("without recording an observation");
+
+    // With no runtime id and no key, preflight must fail closed and name both
+    // gaps rather than leaving the operator to discover them one at a time.
+    const bare = runCliEnv(["sentinel", "preflight", tempProject(), "--format", "json"], {
+      SEAMSHIELD_SENTINEL_RUNTIME_ID: "",
+      SEAMSHIELD_SENTINEL_KEY: "",
+    });
+    expect(bare.status).toBe(2);
+    const report = JSON.parse(bare.stdout);
+    expect(report.schema).toBe("seamshield.sentinel-preflight/v1");
+    expect(report.ready).toBe(false);
+    const ids = report.checks.map((check: { id: string }) => check.id);
+    expect(ids).toContain("runtime_id");
+    expect(ids).toContain("sentinel_key");
+    expect(ids).toContain("collector");
+    // Every failing check must carry an actionable fix, not just a diagnosis.
+    for (const check of report.checks) {
+      if (check.state === "fail") expect(String(check.fix || "")).not.toBe("");
+    }
+    // The enrollment key must never be echoed back, even when it is present.
+    const withKey = runCliEnv(["sentinel", "preflight", tempProject(), "--format", "json"], {
+      SEAMSHIELD_SENTINEL_RUNTIME_ID: "runtime_preflightcanary01",
+      SEAMSHIELD_SENTINEL_KEY: "ssse_preflightsecretcanary",
+      SEAMSHIELD_API_URL: "http://127.0.0.1:9/api",
+    });
+    expect(withKey.stdout).not.toContain("ssse_preflightsecretcanary");
+    expect(withKey.stderr).not.toContain("ssse_preflightsecretcanary");
+  });
+
+  it("derives the deployed commit and branch from the provider environment", async () => {
+    // The gate auto-detected the commit but not the branch, so a host that set
+    // neither silently verified the binding's default branch instead of the
+    // branch actually being deployed.
+    const requests: string[] = [];
+    const server = createServer((req, res) => {
+      requests.push(String(req.url));
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ deployment_gate: { allowed: true, reason: "release_gate_passed", release_receipt_digest: "sha256:testdigest", receipt_created_at: "2026-07-24T00:00:00.000Z" } }));
+    });
+    await new Promise<void>((ready) => server.listen(0, "127.0.0.1", ready));
+    const apiUrl = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+    // Empty values are falsy, so this neutralizes any provider variables that
+    // happen to be set on the machine running the suite.
+    const base = {
+      SEAMSHIELD_SERVER_KEY: "sssk_gatecanary",
+      SEAMSHIELD_DEPLOY_COMMIT: "",
+      SEAMSHIELD_DEPLOY_BRANCH: "",
+      CI_COMMIT_SHA: "",
+      CI_COMMIT_BRANCH: "",
+      BITBUCKET_COMMIT: "",
+      BITBUCKET_BRANCH: "",
+      BUILD_SOURCEVERSION: "",
+      BUILD_SOURCEBRANCHNAME: "",
+      CIRCLE_SHA1: "",
+      CIRCLE_BRANCH: "",
+    };
+    try {
+      const detected = await runCliEnvAsync(["deploy-gate", "verify", "--project-id", "project_gate", "--api-url", apiUrl], {
+        ...base,
+        GITHUB_SHA: "1111111111111111111111111111111111111111",
+        GITHUB_REF_NAME: "release-train",
+      });
+      expect(detected.status).toBe(0);
+      expect(requests[0]).toContain("commit_digest=1111111111111111111111111111111111111111");
+      expect(requests[0]).toContain("branch=release-train");
+
+      // An explicit branch must still win over provider detection.
+      const explicit = await runCliEnvAsync(["deploy-gate", "verify", "--project-id", "project_gate", "--api-url", apiUrl, "--branch", "main"], {
+        ...base,
+        GITHUB_SHA: "2222222222222222222222222222222222222222",
+        GITHUB_REF_NAME: "release-train",
+      });
+      expect(explicit.status).toBe(0);
+      expect(requests[1]).toContain("branch=main");
+
+      // The server key must never be echoed into command output.
+      expect(detected.stdout).not.toContain("sssk_gatecanary");
+    } finally {
+      await new Promise<void>((closed) => server.close(() => closed()));
+    }
+  }, 20_000);
+
+  it("reports onboarding stage state and the exact next command", () => {
+    // Onboarding spans six surfaces. `setup` must answer "what do I run next"
+    // without the user stitching together four other status commands.
+    const fresh = tempProject();
+    const initial = runCli(["setup", fresh, "--format", "json"]);
+    // A required stage is still pending, so this is usable as a script gate.
+    expect(initial.status).toBe(1);
+    const freshReport = JSON.parse(initial.stdout);
+    expect(freshReport.schema).toBe("seamshield.setup/v1");
+    expect(freshReport.required_complete).toBe(false);
+    expect(freshReport.next.stage).toBe("local_scan");
+
+    const project = tempProject();
+    spawnSync("git", ["init", "-q", "."], { cwd: project, encoding: "utf8" });
+    mkdirSync(join(project, ".seamshield"), { recursive: true });
+    mkdirSync(join(project, ".github", "workflows"), { recursive: true });
+    writeFileSync(join(project, ".seamshield", "config.yaml"), "version: 1\n");
+    writeFileSync(join(project, ".seamshield", "connection.json"), `${JSON.stringify({
+      schema: "seamshield.local-connection/v1",
+      project: { id: "project_demo", name: "Demo App" },
+      api_url: "https://platform.seamshield.com/api",
+      server_key: "sssk_setupcanary",
+      source_upload: false,
+      ci: { provider: "github", status: "configured" },
+    })}\n`);
+    writeFileSync(join(project, ".github", "workflows", "seamshield.yml"), "jobs:\n  ship:\n    steps:\n      - run: npx @seamshield/cli ship . --offline\n");
+
+    // A generated but uncommitted workflow has never run, so CI is not done.
+    const uncommitted = JSON.parse(runCli(["setup", project, "--format", "json"]).stdout);
+    const ciStage = uncommitted.stages.find((stage: { id: string }) => stage.id === "ci");
+    expect(ciStage.state).toBe("pending");
+    expect(ciStage.next_command).toContain(".github/workflows/seamshield.yml");
+    // The suggested command must be repo-relative, not an absolute temp path.
+    expect(ciStage.next_command).not.toContain(project);
+
+    spawnSync("git", ["add", "-A"], { cwd: project, encoding: "utf8" });
+    spawnSync("git", ["-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-qm", "init"], { cwd: project, encoding: "utf8" });
+    const committed = runCli(["setup", project, "--format", "json"]);
+    expect(committed.status).toBe(0);
+    const committedReport = JSON.parse(committed.stdout);
+    expect(committedReport.required_complete).toBe(true);
+    // Optional stages remain visible, but never block the required path.
+    expect(committedReport.stages.find((stage: { id: string }) => stage.id === "sentinel").state).toBe("pending");
+    // The persisted runtime server key must never appear in setup output.
+    expect(committed.stdout).not.toContain("sssk_setupcanary");
+  }, 20_000);
+
+  it("fails closed on setup paths that cannot actually work", () => {
+    // `learn --source` previously exited 0 while applying nothing.
+    const learn = runCli(["learn", "--source", "https://example.com/bundle.json"]);
+    expect(learn.status).toBe(2);
+    expect(learn.stderr).toContain("was not applied");
+    expect(runCli(["learn"]).status).toBe(0);
+
+    // `ci install` advertised provider detection but always wrote GitHub Actions.
+    const gitlab = tempProject();
+    writeFileSync(join(gitlab, ".gitlab-ci.yml"), "stages: [test]\n");
+    const detected = runCli(["ci", "install", gitlab]);
+    expect(detected.status).toBe(2);
+    expect(detected.stderr).toContain("detected gitlab");
+    expect(existsSync(join(gitlab, ".github", "workflows", "seamshield.yml"))).toBe(false);
+    expect(runCli(["ci", "install", gitlab, "--provider", "github"]).status).toBe(0);
+
+    // `status --format json` must never print the persisted runtime server key.
+    const connected = tempProject();
+    mkdirSync(join(connected, ".seamshield"), { recursive: true });
+    writeFileSync(join(connected, ".seamshield", "connection.json"), `${JSON.stringify({
+      schema: "seamshield.local-connection/v1",
+      project: { id: "project_leak", name: "Leak canary" },
+      api_url: "https://platform.seamshield.com/api",
+      server_key: "sssk_LEAKCANARY",
+      source_upload: false,
+    })}\n`);
+    const status = runCli(["status", connected, "--format", "json"]);
+    expect(status.status).toBe(0);
+    expect(status.stdout).not.toContain("sssk_LEAKCANARY");
+    expect(JSON.parse(status.stdout).connection.server_key_present).toBe(true);
+  }, 20_000);
 
   it("runs a Community doctor health check", () => {
     const dir = tempProject();

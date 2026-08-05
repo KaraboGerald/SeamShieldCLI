@@ -126,6 +126,9 @@ export async function checkHallucinatedPackages(
   const timeoutMs = options.timeoutMs ?? 750;
   const findings: Finding[] = [];
   for (const dep of collectDependencies(ctx, files)) {
+    if (dep.spec.startsWith("workspace:") || dep.spec.startsWith("file:") || dep.spec.startsWith("link:")) {
+      continue;
+    }
     const cached = readCache<{ exists: boolean }>(ctx, "npm", dep.name);
     let exists = cached?.exists;
     if (exists === undefined) {

@@ -1013,6 +1013,22 @@ function writeGenericCiScript(target: string, automation: CiAutomation): string 
 
 const DEFAULT_CONNECTED_API_URL = "https://platform.seamshield.com/api";
 
+const DEPLOY_GATE_SECRET_GUIDE = "The deployment gate needs three host secrets: SEAMSHIELD_API_URL, SEAMSHIELD_PROJECT_ID, and SEAMSHIELD_SERVER_KEY. Read them from .seamshield/connection.json after `seamshield connect`, or reveal a fresh runtime server key in Console -> Build -> Platform. Build and Guard CI use provider OIDC and do not need these.";
+
+function runtimeServerKey(): string {
+  return (process.env.SEAMSHIELD_SERVER_KEY || process.env.SEAMSHIELD_RUNTIME_SERVER_KEY || "").trim();
+}
+
+// Scanner severities are block/high/warn/info; the backend projection and
+// Console speak critical/high/medium/low. Translating here keeps a blocking
+// lane from rendering as a non-blocking warning in the Console verdict.
+function projectionSeverity(severity: string): string {
+  if (severity === "block") return "critical";
+  if (severity === "warn") return "medium";
+  if (severity === "info") return "low";
+  return severity;
+}
+
 function trustedConnectedApiUrl(value: unknown): string | null {
   try {
     const url = new URL(String(value || "").trim());
@@ -1083,6 +1099,11 @@ type SentinelEnrollment = {
   runtime_id: string;
   api_url: string;
   enrolled_at: string;
+  // Enrollment alone never proves the collector works. Recording the last
+  // accepted observation locally lets `setup` and `doctor` distinguish "a
+  // runtime id exists" from "this host is actually reporting".
+  last_observed_at?: string;
+  last_service_count?: number;
 };
 
 function sentinelIdentityPath(target: string): string { return join(target, ".seamshield", "sentinel.json"); }
@@ -1105,27 +1126,112 @@ function writeSentinelEnrollment(target: string, enrollment: SentinelEnrollment)
   ignoreLocalConnection(target);
 }
 
-function boundedListeningTcpPorts(): SentinelService[] {
+// A container-published port maps to a real service name the operator already
+// recognises, but the collector only ever saw the number. That produced a wall
+// of identical `tcp-<port>` rows in Sentinel, which nobody can make an approval
+// decision from. Read the published-port mapping from the container runtime
+// when one is present; this is metadata only, and no host identity, IP address,
+// image digest, or environment value is collected.
+function dockerPublishedPortLabels(): Map<number, string> {
+  const labels = new Map<number, string>();
+  for (const command of ["docker", "podman"]) {
+    try {
+      const output = execFileSync(command, ["ps", "--format", "{{.Names}}\t{{.Ports}}"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 5_000 });
+      for (const line of output.split("\n")) {
+        const [rawName, rawPorts] = line.split("\t");
+        const name = String(rawName || "").trim();
+        if (!name || !rawPorts) continue;
+        // Only the host-side published port is used. A container port that is
+        // not published is not reachable from the host and is not labelled.
+        for (const match of rawPorts.matchAll(/(?:^|,\s*)(?:[0-9.:\[\]]*?:)?(\d{1,5})->\d{1,5}\/tcp/g)) {
+          const port = Number(match[1]);
+          if (!Number.isInteger(port) || port < 1 || port > 65535) continue;
+          if (!labels.has(port)) labels.set(port, name);
+        }
+      }
+      if (labels.size > 0) return labels;
+    } catch { /* No container runtime on this host; fall back to the port number. */ }
+  }
+  return labels;
+}
+
+// The backend accepts service_ref as /^[a-zA-Z0-9._:-]{1,160}$/ and drops any
+// field outside its allow-list, so the human-readable name has to travel inside
+// the reference itself rather than as a separate attribute.
+function sentinelServiceRef(port: number, containerName: string | undefined): string {
+  if (!containerName) return `tcp-${port}`;
+  const safe = containerName.replace(/[^a-zA-Z0-9._-]/g, "-").replace(/^-+|-+$/g, "").slice(0, 100);
+  return safe ? `${safe}:tcp-${port}` : `tcp-${port}`;
+}
+
+// `ss -H -ltn` prints five whitespace-separated columns:
+//
+//   LISTEN 0 4096 0.0.0.0:5432 0.0.0.0:*
+//   LISTEN 0 4096 [::]:80      [::]:*
+//   LISTEN 0 4096 127.0.0.53%lo:53 0.0.0.0:*
+//
+// The local address is column four, and a *peer* column always follows it. An
+// earlier end-of-line match (`/:(\d+)\s*$/gm`) therefore matched the peer's
+// `:*` on no line at all and silently returned zero listeners, so a host that
+// was fully discoverable reported a "successful" observation with nothing in
+// it. Parse the local-address column explicitly instead of anchoring to EOL.
+function parseSsListeners(output: string): number[] {
+  const ports: number[] = [];
+  for (const line of output.split("\n")) {
+    const columns = line.trim().split(/\s+/);
+    if (columns.length < 4) continue;
+    // Tolerate builds that omit the leading state column under `-H`.
+    const local = /^LISTEN$/i.test(columns[0]) ? columns[3] : columns[2];
+    if (!local) continue;
+    // Strip the IPv6 bracket form and any `%iface` scope before the port.
+    const match = local.match(/:(\d+)$/);
+    if (match) ports.push(Number(match[1]));
+  }
+  return ports;
+}
+
+type SentinelDiscovery = {
+  services: SentinelService[];
+  collector_available: boolean;
+  collector: string | null;
+  // True when a collector ran and parsed cleanly but saw no listener at all.
+  // On a real server this almost always means the collector is confined to its
+  // own network namespace rather than that the host is genuinely idle.
+  discovery_empty: boolean;
+};
+
+// Distinguish "this host has no listeners" from "no discovery utility exists"
+// from "a collector ran but could see nothing". All three previously produced
+// an empty list, so a host that could never observe anything reported success.
+function boundedListeningTcpPorts(): SentinelDiscovery {
   const attempts: Array<{ command: string; args: string[]; parse: (output: string) => number[] }> = [
-    {
-      command: "ss",
-      args: ["-H", "-ltn"],
-      parse: (output) => [...output.matchAll(/:(\d+)\s*$/gm)].map((match) => Number(match[1])),
-    },
+    { command: "ss", args: ["-H", "-ltn"], parse: parseSsListeners },
     {
       command: "lsof",
       args: ["-nP", "-iTCP", "-sTCP:LISTEN"],
       parse: (output) => [...output.matchAll(/:(\d+)\s+\(LISTEN\)/g)].map((match) => Number(match[1])),
     },
   ];
+  let ran: string | null = null;
   for (const attempt of attempts) {
+    let output: string;
     try {
-      const output = execFileSync(attempt.command, attempt.args, { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
-      const ports = [...new Set(attempt.parse(output).filter((port) => Number.isInteger(port) && port > 0 && port <= 65535))].sort((a, b) => a - b).slice(0, 32);
-      return ports.map((port) => ({ service_ref: `tcp-${port}`, exposure: "unknown", transport: "tcp", port, state: "unknown" }));
-    } catch { /* Try the next platform-native listener utility. */ }
+      output = execFileSync(attempt.command, attempt.args, { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 10_000 });
+    } catch { continue; /* Try the next platform-native listener utility. */ }
+    ran = attempt.command;
+    const ports = [...new Set(attempt.parse(output).filter((port) => Number.isInteger(port) && port > 0 && port <= 65535))].sort((a, b) => a - b).slice(0, 32);
+    // A collector that runs but parses nothing is not proof of an idle host.
+    // Fall through to the next collector before concluding "no services".
+    if (!ports.length) continue;
+    const containerNames = dockerPublishedPortLabels();
+    return {
+      services: ports.map((port) => ({ service_ref: sentinelServiceRef(port, containerNames.get(port)), exposure: "unknown", transport: "tcp", port, state: "unknown" })),
+      collector_available: true,
+      collector: attempt.command,
+      discovery_empty: false,
+    };
   }
-  return [];
+  return { services: [], collector_available: ran !== null, collector: ran, discovery_empty: ran !== null };
 }
 
 function shellQuote(value: string): string { return `'${String(value).replaceAll("'", `'"'"'`)}'`; }
@@ -1195,6 +1301,12 @@ function installSentinelSchedule(target: string): number {
   console.log(`Sentinel schedule installed · ${unit}.timer`);
   console.log(`Every 15 minutes · server observation${existsSync(envPath) ? " · optional Cloudflare observation when CLOUDFLARE_API_TOKEN is set" : ""}`);
   console.log(`Secret file: ${envPath} (mode 0600) · ${suppliedSentinelKey ? "enrollment key stored from the protected process environment" : "set SEAMSHIELD_SENTINEL_KEY before the first run"} · source upload: false`);
+  if (!suppliedSentinelKey && !/^SEAMSHIELD_SENTINEL_KEY=\S/m.test(readFileSync(envPath, "utf8"))) {
+    // The timer is installed but every run will abort on the missing key.
+    // Reporting success here produced silently non-observing hosts.
+    console.error(`seamshield sentinel install: installed_but_unconfigured · no enrollment key is present, so scheduled runs will not observe. Set SEAMSHIELD_SENTINEL_KEY in ${envPath} (or re-run with it exported), then run \`seamshield sentinel observe ${target}\` once to confirm.`);
+    return 2;
+  }
   return 0;
 }
 
@@ -1231,7 +1343,27 @@ async function observeSentinel(target: string, options: { apiUrl?: string; runti
     console.error("seamshield sentinel observe: --environment must be a short environment label");
     return 2;
   }
-  const services = boundedListeningTcpPorts();
+  const discovery = boundedListeningTcpPorts();
+  const services = discovery.services;
+  if (!discovery.collector_available) {
+    console.error("seamshield sentinel observe: collector_capability_missing · neither `ss` nor `lsof` is available on this host, so no listener can be discovered. Nothing was submitted.");
+    console.error("Fix: install iproute2 (ss) or lsof on the host, then re-run. Run `seamshield sentinel preflight` to re-check.");
+    return 2;
+  }
+  // A collector that runs but sees nothing is the single highest-signal
+  // symptom of a misconfigured Sentinel install: it happens when the collector
+  // is confined to its own network namespace (an app container rather than the
+  // host), which is exactly the mistake that looks like success. Submitting an
+  // empty observation here records a signed receipt that says "this runtime
+  // exposes nothing", which is worse than not observing at all.
+  if (discovery.discovery_empty && !process.env.SEAMSHIELD_SENTINEL_ALLOW_EMPTY) {
+    console.error(`seamshield sentinel observe: collector_saw_no_listeners · \`${discovery.collector}\` ran but found no listening TCP socket. Nothing was submitted.`);
+    console.error("This nearly always means the collector cannot see the host's network namespace, not that the host is idle.");
+    console.error("Fix: run Sentinel on the server host itself. In a container, it needs the host network and PID namespaces:");
+    console.error("  docker run --rm --privileged --network host --pid host ...");
+    console.error("If this host genuinely serves nothing, set SEAMSHIELD_SENTINEL_ALLOW_EMPTY=1 to record an empty observation on purpose.");
+    return 2;
+  }
   const response = await fetch(`${apiUrl}/v1/sentinel/runtimes/${encodeURIComponent(runtimeId)}/receipts`, {
     method: "POST",
     headers: { "content-type": "application/json", accept: "application/json", "x-seamshield-sentinel-key": sentinelKey },
@@ -1242,6 +1374,17 @@ async function observeSentinel(target: string, options: { apiUrl?: string; runti
     console.error(`seamshield sentinel observe: ${String(body.error || `collector receipt rejected (${response.status})`)}`);
     return response.status === 401 || response.status === 403 ? 2 : 1;
   }
+  // Persist proof that this host actually reported, so `setup` and `doctor`
+  // can distinguish an enrolled runtime from a reporting one.
+  if (enrollment) {
+    try {
+      writeSentinelEnrollment(target, {
+        ...enrollment,
+        last_observed_at: body.sentinel_observation?.created_at || new Date().toISOString(),
+        last_service_count: services.length,
+      });
+    } catch { /* A read-only checkout must not fail an accepted observation. */ }
+  }
   console.log(`Sentinel observation recorded · ${runtimeId}`);
   console.log(`Runtime: ${runtimeId} · ${environment}`);
   console.log(`Services: ${services.length} bounded TCP listeners · attach matching workload references in Sentinel to project their posture`);
@@ -1250,14 +1393,134 @@ async function observeSentinel(target: string, options: { apiUrl?: string; runti
   return 0;
 }
 
-async function observeCloudflare(target: string, options: { apiUrl?: string; edgeAttachmentIds?: string[] }): Promise<number> {
+type PreflightCheck = {
+  id: string;
+  title: string;
+  state: "pass" | "fail" | "warn";
+  detail: string;
+  fix?: string;
+};
+
+// Every Sentinel setup failure observed in the field was silent: the runtime
+// looked enrolled, the command exited 0, and the Console still showed nothing.
+// Preflight makes each precondition individually checkable *before* a receipt
+// is submitted, so the operator (or an agent) gets one actionable failure
+// instead of an empty dashboard with no explanation.
+async function sentinelPreflight(target: string, options: { apiUrl?: string; runtimeId?: string; environment?: string; format?: string }): Promise<number> {
+  const stored = readLocalConnection(target);
+  const enrollment = readSentinelEnrollment(target);
+  const apiUrl = connectedApiUrl(options.apiUrl || process.env.SEAMSHIELD_API_URL, stored);
+  const runtimeId = String(options.runtimeId || process.env.SEAMSHIELD_SENTINEL_RUNTIME_ID || enrollment?.runtime_id || "").trim();
+  const sentinelKey = String(process.env.SEAMSHIELD_SENTINEL_KEY || "").trim();
+  const checks: PreflightCheck[] = [];
+
+  // 1. Runtime identity.
+  checks.push(runtimeId
+    ? { id: "runtime_id", title: "Runtime enrolled", state: "pass", detail: `Runtime ${runtimeId}.` }
+    : {
+        id: "runtime_id",
+        title: "Runtime enrolled",
+        state: "fail",
+        detail: "No runtime id in .seamshield/sentinel.json or SEAMSHIELD_SENTINEL_RUNTIME_ID.",
+        fix: "Copy the one-time command from Console -> Agent -> Sentinel -> Enroll runtime.",
+      });
+
+  // 2. Enrollment key. Never printed, only ever tested for presence and shape.
+  checks.push(sentinelKey
+    ? /^ssse_/.test(sentinelKey)
+      ? { id: "sentinel_key", title: "Enrollment key present", state: "pass", detail: "SEAMSHIELD_SENTINEL_KEY is set in this process environment." }
+      : { id: "sentinel_key", title: "Enrollment key present", state: "warn", detail: "SEAMSHIELD_SENTINEL_KEY is set but does not look like an `ssse_` enrollment key.", fix: "Reveal a fresh key with Rotate enrollment credential in Sentinel." }
+    : {
+        id: "sentinel_key",
+        title: "Enrollment key present",
+        state: "fail",
+        detail: "SEAMSHIELD_SENTINEL_KEY is not set in this process environment.",
+        fix: "Set it in the host or CI secret store, never in the repository.",
+      });
+
+  // 3. API base URL. A base missing the `/api` suffix 404s on every receipt,
+  //    which previously surfaced only as an opaque rejection.
+  checks.push(/\/api$/.test(apiUrl)
+    ? { id: "api_url", title: "API base URL", state: "pass", detail: apiUrl }
+    : { id: "api_url", title: "API base URL", state: "warn", detail: `${apiUrl} does not end in /api.`, fix: `Set SEAMSHIELD_API_URL=${apiUrl.replace(/\/$/, "")}/api` });
+
+  // 4. Collector capability and visibility — the failure that looked like success.
+  const discovery = boundedListeningTcpPorts();
+  if (!discovery.collector_available) {
+    checks.push({
+      id: "collector",
+      title: "Listener collector",
+      state: "fail",
+      detail: "Neither `ss` nor `lsof` exists on this host, so no listener can ever be discovered.",
+      fix: "Install iproute2 (ss) or lsof.",
+    });
+  } else if (discovery.discovery_empty) {
+    checks.push({
+      id: "collector",
+      title: "Listener collector",
+      state: "fail",
+      detail: `\`${discovery.collector}\` ran but saw no listening socket. Sentinel is almost certainly confined to its own network namespace.`,
+      fix: "Run Sentinel on the server host. In a container add --network host --pid host (and --privileged to read socket ownership).",
+    });
+  } else {
+    checks.push({
+      id: "collector",
+      title: "Listener collector",
+      state: "pass",
+      detail: `\`${discovery.collector}\` discovered ${discovery.services.length} bounded TCP listener(s).`,
+    });
+  }
+
+  // 5. Live credential check. This is the only way to distinguish a good local
+  //    setup from one the backend will reject, without recording a receipt.
+  if (runtimeId && sentinelKey) {
+    try {
+      const response = await fetch(`${apiUrl}/v1/sentinel/runtimes/${encodeURIComponent(runtimeId)}/receipts`, {
+        method: "POST",
+        headers: { "content-type": "application/json", accept: "application/json", "x-seamshield-sentinel-key": sentinelKey, "x-seamshield-dry-run": "1" },
+        body: JSON.stringify({ environment: String(options.environment || "production"), collector_version: pkg.version, services: [], firewall_state: "unknown", tls_state: "unknown", dry_run: true }),
+      });
+      checks.push(response.status === 401 || response.status === 403
+        ? { id: "credential", title: "Backend accepts this runtime + key", state: "fail", detail: `Backend rejected the enrollment key (${response.status}).`, fix: "Rotate the enrollment credential in Sentinel and update the host secret." }
+        : response.status === 404
+          ? { id: "credential", title: "Backend accepts this runtime + key", state: "fail", detail: `Runtime not found at ${apiUrl} (404).`, fix: "Check SEAMSHIELD_API_URL includes /api and that the runtime id matches the Console." }
+          : { id: "credential", title: "Backend accepts this runtime + key", state: "pass", detail: `Reachable at ${apiUrl}.` });
+    } catch (error) {
+      checks.push({ id: "credential", title: "Backend accepts this runtime + key", state: "warn", detail: `Could not reach ${apiUrl}: ${error instanceof Error ? error.message : String(error)}`, fix: "Check outbound network access from this host." });
+    }
+  }
+
+  const failed = checks.filter((check) => check.state === "fail");
+  if (String(options.format || "").toLowerCase() === "json") {
+    console.log(JSON.stringify({ schema: "seamshield.sentinel-preflight/v1", target, runtime_id: runtimeId || null, api_url: apiUrl, ready: failed.length === 0, checks }, null, 2));
+    return failed.length ? 2 : 0;
+  }
+  console.log("SeamShield Sentinel Preflight");
+  console.log("");
+  for (const check of checks) {
+    console.log(`${check.state === "pass" ? "PASS" : check.state === "warn" ? "WARN" : "FAIL"}  ${check.title}`);
+    console.log(`      ${check.detail}`);
+    if (check.fix) console.log(`      fix: ${check.fix}`);
+  }
+  console.log("");
+  console.log(failed.length
+    ? `Not ready · ${failed.length} blocking check(s). Nothing was submitted.`
+    : "Ready · run `seamshield sentinel observe` to record the first signed observation.");
+  return failed.length ? 2 : 0;
+}
+
+async function observeCloudflare(target: string, options: { apiUrl?: string; edgeAttachmentIds?: string[]; discover?: boolean; zoneRefs?: string[] }): Promise<number> {
   const stored = readLocalConnection(target);
   const enrollment = readSentinelEnrollment(target);
   const apiUrl = connectedApiUrl(options.apiUrl || process.env.SEAMSHIELD_API_URL, stored);
   const sentinelKey = process.env.SEAMSHIELD_SENTINEL_KEY || "";
   const cloudflareToken = String(process.env.CLOUDFLARE_API_TOKEN || "").trim();
   const edgeAttachmentIds = options.edgeAttachmentIds?.length ? options.edgeAttachmentIds : String(process.env.SEAMSHIELD_SENTINEL_EDGE_ATTACHMENT_IDS || "").split(",").map((value) => value.trim()).filter(Boolean);
-  if (!enrollment?.runtime_id || !sentinelKey || !edgeAttachmentIds.length) {
+  const selectedZoneRefs = new Set((options.zoneRefs?.length ? options.zoneRefs : String(process.env.SEAMSHIELD_SENTINEL_ZONE_REFS || "").split(",")).map((value) => value.trim()).filter(Boolean));
+  // Discovery is read-only: it derives the opaque zone references the Console
+  // attachment form asks for. Without it a user cannot produce that value at
+  // all, because it is sha256(raw zone id) computed only inside this CLI.
+  if (!options.discover && (!enrollment?.runtime_id || !sentinelKey || !edgeAttachmentIds.length)) {
     console.error("seamshield sentinel cloudflare: enroll the runtime, set SEAMSHIELD_SENTINEL_KEY, and set SEAMSHIELD_SENTINEL_EDGE_ATTACHMENT_IDS from the Sentinel edge attachment");
     return 2;
   }
@@ -1271,23 +1534,79 @@ async function observeCloudflare(target: string, options: { apiUrl?: string; edg
     if (!response.ok || !body.success) throw new Error(`Cloudflare API request failed (${response.status})`);
     return body;
   };
+  // Posture reads beyond the base zone lookup need broader token scope. A
+  // narrower token must still produce a valid observation, so these degrade to
+  // the honest "unknown" rather than failing the whole run.
+  const cfOptional = async <T>(path: string): Promise<T | null> => {
+    try { return await cf(path) as T; } catch { return null; }
+  };
   try {
-    const zones = await cf("/zones?per_page=50") as { result?: Array<{ id?: string }> };
+    const zones = await cf("/zones?per_page=50") as { result?: Array<{ id?: string; name?: string }> };
+    const zoneRef = (zoneId: string) => `cfz_${createHash("sha256").update(zoneId, "utf8").digest("hex").slice(0, 32)}`;
+    if (options.discover) {
+      const discovered = (zones.result || []).slice(0, 50).filter((zone) => zone.id);
+      if (!discovered.length) {
+        console.error("seamshield sentinel cloudflare: this Cloudflare token can read no zones. Grant it Zone:Read for the zones you want to observe.");
+        return 2;
+      }
+      console.log("Opaque zone references for this Cloudflare token:");
+      console.log("");
+      for (const zone of discovered) console.log(`${zoneRef(String(zone.id))}  ${zone.name || "(name unavailable)"}`);
+      console.log("");
+      console.log("Paste the reference for the zone you want into Sentinel -> Attach Cloudflare edge.");
+      console.log("Zone names are printed locally for selection only. SeamShield receives the opaque reference, never the name, raw zone id, or token.");
+      return 0;
+    }
+    // A token that can read several zones previously submitted the same
+    // attachment ids for every one of them. The backend requires the
+    // attachment's zone_ref to match the observation exactly, so every zone
+    // except the attached one returned 403 and the whole command failed.
+    const visible = (zones.result || []).slice(0, 50).filter((zone) => zone.id);
+    const targeted = selectedZoneRefs.size
+      ? visible.filter((zone) => selectedZoneRefs.has(zoneRef(String(zone.id))))
+      : visible;
+    if (selectedZoneRefs.size && !targeted.length) {
+      console.error("seamshield sentinel cloudflare: none of the requested zone references are visible to this Cloudflare token. Run `seamshield sentinel cloudflare . --discover` to list the references it can read.");
+      return 2;
+    }
+    if (!selectedZoneRefs.size && visible.length > 1) {
+      console.error(`seamshield sentinel cloudflare: this token reads ${visible.length} zones, but edge attachments are bound to one zone reference each. Submitting all of them would be rejected for every zone except the attached one.`);
+      console.error("Select the zone(s) to observe with --zone-ref (or SEAMSHIELD_SENTINEL_ZONE_REFS). Run `seamshield sentinel cloudflare . --discover` to list them.");
+      return 2;
+    }
     const records = [];
-    for (const zone of (zones.result || []).slice(0, 50)) {
+    for (const zone of targeted) {
       const zoneId = String(zone.id || "");
       if (!zoneId) continue;
-      const [dns, redirect] = await Promise.all([
+      const [dns, proxied, redirect, firewall, tls] = await Promise.all([
         cf(`/zones/${encodeURIComponent(zoneId)}/dns_records?per_page=1`) as Promise<{ result_info?: { total_count?: number } }>,
-        cf(`/zones/${encodeURIComponent(zoneId)}/settings/always_use_https`) as Promise<{ result?: { value?: string } }>,
+        cfOptional<{ result_info?: { total_count?: number } }>(`/zones/${encodeURIComponent(zoneId)}/dns_records?per_page=1&proxied=true`),
+        cfOptional<{ result?: { value?: string } }>(`/zones/${encodeURIComponent(zoneId)}/settings/always_use_https`),
+        cfOptional<{ result?: Array<unknown> }>(`/zones/${encodeURIComponent(zoneId)}/firewall/rules?per_page=1`),
+        cfOptional<{ result?: { certificates?: Array<{ expires_on?: string }> } | Array<{ expires_on?: string }> }>(`/zones/${encodeURIComponent(zoneId)}/ssl/certificate_packs?status=all`),
       ]);
+      // Every field below is either read from Cloudflare or reported as
+      // "unknown". Previously proxied_records_count was hardcoded to 0 and
+      // firewall/TLS were always "unknown", so the Console presented
+      // unobserved values as though they were measured edge posture.
+      const certificates = Array.isArray(tls?.result)
+        ? tls?.result as Array<{ expires_on?: string }>
+        : (tls?.result as { certificates?: Array<{ expires_on?: string }> } | undefined)?.certificates;
+      const soonestExpiry = (certificates || [])
+        .map((certificate) => Date.parse(String(certificate?.expires_on || "")))
+        .filter((value) => Number.isFinite(value))
+        .sort((a, b) => a - b)[0];
+      const tlsState = soonestExpiry === undefined
+        ? "unknown"
+        : soonestExpiry <= Date.now() ? "invalid"
+          : soonestExpiry - Date.now() <= 30 * 24 * 60 * 60 * 1000 ? "expiring" : "current";
       const body = {
-        zone_ref: `cfz_${createHash("sha256").update(zoneId, "utf8").digest("hex").slice(0, 32)}`,
+        zone_ref: zoneRef(zoneId),
         dns_records_count: Math.max(0, Number(dns.result_info?.total_count || 0)),
-        proxied_records_count: 0,
-        https_redirect: redirect.result?.value === "on" ? "enabled" : redirect.result?.value === "off" ? "disabled" : "unknown",
-        firewall_state: "unknown",
-        tls_state: "unknown",
+        proxied_records_count: Math.max(0, Number(proxied?.result_info?.total_count || 0)),
+        https_redirect: redirect?.result?.value === "on" ? "enabled" : redirect?.result?.value === "off" ? "disabled" : "unknown",
+        firewall_state: firewall === null ? "unknown" : (firewall.result || []).length > 0 ? "managed" : "unmanaged",
+        tls_state: tlsState,
       };
       const response = await fetch(`${apiUrl}/v1/sentinel/edge/receipts`, {
         method: "POST",
@@ -1298,7 +1617,7 @@ async function observeCloudflare(target: string, options: { apiUrl?: string; edg
       if (!response.ok) throw new Error(String(receipt.error || `SeamShield receipt rejected (${response.status})`));
       records.push(receipt.sentinel_observation?.digest || "recorded");
     }
-    console.log(`Sentinel Cloudflare observations recorded · ${enrollment.runtime_id}`);
+    console.log(`Sentinel Cloudflare observations recorded · ${enrollment?.runtime_id || "unknown runtime"}`);
     console.log(`Zones: ${records.length} opaque zone references · DNS names and Cloudflare token excluded`);
     console.log(`Receipts: ${records.map((value) => String(value).slice(0, 12)).join(" · ") || "none"}`);
     console.log("Source upload: false · Cloudflare token stays in the local secret store");
@@ -1547,17 +1866,28 @@ function requireReceiptDigest(value: unknown, label: string): string {
   return digest;
 }
 
-async function verifyDeploymentGate(options: { projectId?: string; commit?: string; branch?: string; environment: string; apiUrl: string }): Promise<void> {
-  const projectId = options.projectId || process.env.SEAMSHIELD_PROJECT_ID || "";
+async function verifyDeploymentGate(options: { projectId?: string; commit?: string; branch?: string; environment: string; apiUrl: string; target?: string }): Promise<void> {
+  const stored = readLocalConnection(options.target || process.cwd());
+  const projectId = options.projectId || process.env.SEAMSHIELD_PROJECT_ID || stored?.project.id || "";
   const commitDigest = options.commit || process.env.SEAMSHIELD_DEPLOY_COMMIT || process.env.GITHUB_SHA || process.env.CI_COMMIT_SHA || process.env.BITBUCKET_COMMIT || process.env.BUILD_SOURCEVERSION || process.env.CIRCLE_SHA1 || "";
-  const serverKey = process.env.SEAMSHIELD_SERVER_KEY || "";
-  if (!projectId) throw new Error("set SEAMSHIELD_PROJECT_ID or pass --project-id");
-  if (!commitDigest) throw new Error("set SEAMSHIELD_DEPLOY_COMMIT or pass --commit");
-  if (!serverKey) throw new Error("set SEAMSHIELD_SERVER_KEY in the deployment host secret store");
-  const url = new URL(`${options.apiUrl.replace(/\/$/, "")}/v1/projects/${encodeURIComponent(projectId)}/release-gates/verification`);
+  const serverKey = runtimeServerKey() || stored?.server_key || "";
+  if (!projectId) throw new Error(`set SEAMSHIELD_PROJECT_ID or pass --project-id. ${DEPLOY_GATE_SECRET_GUIDE}`);
+  if (!commitDigest) throw new Error("set SEAMSHIELD_DEPLOY_COMMIT or pass --commit. Most CI providers expose the deployed commit automatically; on a deployment host set it to the exact commit being released.");
+  if (!serverKey) throw new Error(`set SEAMSHIELD_SERVER_KEY (or SEAMSHIELD_RUNTIME_SERVER_KEY) in the deployment host secret store. ${DEPLOY_GATE_SECRET_GUIDE}`);
+  const url = new URL(`${connectedApiUrl(options.apiUrl, stored)}/v1/projects/${encodeURIComponent(projectId)}/release-gates/verification`);
   url.searchParams.set("commit_digest", commitDigest);
   url.searchParams.set("environment", options.environment);
-  const branch = options.branch || process.env.SEAMSHIELD_DEPLOY_BRANCH || "";
+  // The commit already auto-detects from every supported CI provider, but the
+  // branch did not, so hosts had to hand-copy one half of a pair the provider
+  // already exposes. Detect the same providers here.
+  const branch = options.branch
+    || process.env.SEAMSHIELD_DEPLOY_BRANCH
+    || process.env.GITHUB_REF_NAME
+    || process.env.CI_COMMIT_BRANCH
+    || process.env.BITBUCKET_BRANCH
+    || process.env.BUILD_SOURCEBRANCHNAME
+    || process.env.CIRCLE_BRANCH
+    || "";
   if (branch) url.searchParams.set("branch", branch);
   const response = await fetch(url, { headers: { "x-seamshield-server-key": serverKey, accept: "application/json" } });
   const body = await response.json().catch(() => ({})) as { error?: string; deployment_gate?: { allowed?: boolean; reason?: string; release_receipt_digest?: string | null; receipt_created_at?: string | null } };
@@ -1569,6 +1899,28 @@ async function verifyDeploymentGate(options: { projectId?: string; commit?: stri
   console.log(`Release receipt: ${(gate.release_receipt_digest || "").slice(0, 18)}`);
   console.log(`Receipt time: ${gate.receipt_created_at || "verified"}`);
   console.log("Source upload: false · deployment host received metadata-only verification");
+}
+
+// Network failures inside connect/sync previously escaped as unhandled
+// rejections (DNS refusal, TLS error, non-JSON 2xx). Classify them here so the
+// user always gets a cause and a next action instead of a stack trace.
+async function runConnectCommand(label: "connect" | "sync", target: string, options: Parameters<typeof connectProject>[1]): Promise<number> {
+  try {
+    return await connectProject(target, options);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    const cause = error instanceof Error && error.cause instanceof Error ? ` (${error.cause.message})` : "";
+    if (/fetch failed|ENOTFOUND|ECONNREFUSED|EAI_AGAIN|ETIMEDOUT|certificate|TLS|socket/i.test(`${detail}${cause}`)) {
+      console.error(`seamshield ${label}: cannot reach the SeamShield backend${cause || ` (${detail})`}. Check network access, VPN, or --api-url. The local connection was left unchanged.`);
+      return 1;
+    }
+    if (error instanceof SyntaxError) {
+      console.error(`seamshield ${label}: the backend returned a response that is not valid JSON. This usually means a proxy or captive portal intercepted the request. The local connection was left unchanged.`);
+      return 1;
+    }
+    console.error(`seamshield ${label}: ${detail}. The local connection was left unchanged.`);
+    return 1;
+  }
 }
 
 async function connectProject(target: string, options: { projectId?: string; token?: string; apiUrl?: string; offline?: boolean; ci?: boolean; ciProvider?: string; ciRepositoryId?: string; ciIssuer?: string; ciJwksUri?: string; ciAudience?: string }): Promise<number> {
@@ -1588,7 +1940,16 @@ async function connectProject(target: string, options: { projectId?: string; tok
   }
   const result = await scanAsync(target, { network: options.offline ? "off" : "on", failOn: "never", profile: "community" });
   const access = buildAccessMap(result);
-  const counts = { critical: access.summary.by_severity.critical || 0, high: access.summary.by_severity.high || 0, medium: access.summary.by_severity.medium || 0, low: access.summary.by_severity.low || 0, total: access.lanes.length };
+  // Scanner severities are block/high/warn/info; the Console and backend
+  // projection speak critical/high/medium/low. Translate once, here, so a
+  // blocking lane cannot render as a non-blocking warning.
+  const counts = {
+    critical: access.summary.by_severity.block || 0,
+    high: access.summary.by_severity.high || 0,
+    medium: access.summary.by_severity.warn || 0,
+    low: access.summary.by_severity.info || 0,
+    total: access.lanes.length,
+  };
   const idempotencyKey = `cli:${Date.now()}:${process.pid}`;
   const inventory = collectInventory(target, { profile: "community" });
   const pathLabel = basename(target) || "local repository";
@@ -1601,7 +1962,7 @@ async function connectProject(target: string, options: { projectId?: string; tok
     permission: lane.permission,
     condition: lane.condition,
     risk: lane.risk,
-    severity: lane.severity,
+    severity: projectionSeverity(lane.severity),
     adapter: lane.provider,
     file: lane.source.file,
     line: lane.source.line,
@@ -1673,8 +2034,12 @@ async function connectProject(target: string, options: { projectId?: string; tok
   const verdict = buildShipVerdict(result);
   const branch = process.env.GITHUB_REF_NAME || process.env.CI_COMMIT_REF_NAME || process.env.BITBUCKET_BRANCH || process.env.BUILD_SOURCEBRANCHNAME || process.env.CIRCLE_BRANCH || "main";
   const commitDigest = process.env.GITHUB_SHA || process.env.CI_COMMIT_SHA || process.env.BITBUCKET_COMMIT || process.env.BUILD_SOURCEVERSION || process.env.CIRCLE_SHA1;
-  const blockedLaneIds = projectLanes.filter((lane) => lane.severity === "block").map((lane) => lane.lane_id);
-  const releaseResponse = await fetch(`${apiUrl}/v1/projects/${encodeURIComponent(projectId)}/release-gates/receipts`, { method: "POST", headers, body: JSON.stringify({ idempotency_key: idempotencyKey, branch, commit_digest: commitDigest, decision: verdict.exitCode === 0 ? "passed" : "blocked", counts, lane_ids: blockedLaneIds, duration_ms: Date.now() - startedAt }) });
+  const blockedLaneIds = projectLanes.filter((lane) => lane.severity === "critical").map((lane) => lane.lane_id);
+  // The receipt carried no environment, so the deployment gate could not tell
+  // which environment a passing run authorized and a staging receipt released
+  // to production. Record it at issue time.
+  const receiptEnvironment = String(process.env.SEAMSHIELD_ENVIRONMENT || "production").trim().toLowerCase();
+  const releaseResponse = await fetch(`${apiUrl}/v1/projects/${encodeURIComponent(projectId)}/release-gates/receipts`, { method: "POST", headers, body: JSON.stringify({ idempotency_key: idempotencyKey, branch, commit_digest: commitDigest, environment: receiptEnvironment, decision: verdict.exitCode === 0 ? "passed" : "blocked", counts, lane_ids: blockedLaneIds, duration_ms: Date.now() - startedAt }) });
   if (!releaseResponse.ok) { console.error(`seamshield connect: release receipt rejected (${releaseResponse.status})`); return 1; }
   const guardHeaders: Record<string, string> = { accept: "application/json" };
   if (automationToken) guardHeaders.authorization = `Bearer ${automationToken}`;
@@ -2015,7 +2380,61 @@ function webAppStatus(target: string) {
   };
 }
 
-function buildDoctorReport(target: string) {
+type ConnectedDoctorReport = {
+  attempted: boolean;
+  connection_file_present: boolean;
+  connection_schema_valid: boolean;
+  project_id_present: boolean;
+  server_key_present: boolean;
+  api_reachable: boolean | null;
+  credential_accepted: boolean | null;
+  deploy_gate_ready: boolean;
+  detail: string;
+};
+
+// `doctor --connected` is the missing end-to-end setup verifier: it proves the
+// stored enrollment actually parses, carries a project and key, and is still
+// accepted by the backend. Local file presence alone was reporting healthy
+// setups that could not authenticate.
+async function verifyConnectedSetup(root: string): Promise<ConnectedDoctorReport> {
+  const filePresent = existsSync(connectionPath(root));
+  const stored = readLocalConnection(root);
+  const projectId = stored?.project?.id || "";
+  const serverKey = runtimeServerKey() || stored?.server_key || "";
+  const deployGateReady = Boolean(projectId && serverKey);
+  const base: ConnectedDoctorReport = {
+    attempted: true,
+    connection_file_present: filePresent,
+    connection_schema_valid: Boolean(stored),
+    project_id_present: Boolean(projectId),
+    server_key_present: Boolean(serverKey),
+    api_reachable: null,
+    credential_accepted: null,
+    deploy_gate_ready: deployGateReady,
+    detail: "",
+  };
+  if (!filePresent) return { ...base, detail: "No .seamshield/connection.json. Generate a connection command in Console, then run `seamshield connect . --token ssconn_...`." };
+  if (!stored) return { ...base, detail: "The stored connection file is unreadable or has an unsupported schema. Re-run `seamshield connect . --token ssconn_...`." };
+  if (!projectId) return { ...base, detail: "The stored connection has no project id. Re-run `seamshield connect . --token ssconn_...`." };
+  if (!serverKey) return { ...base, detail: `No runtime server key available. ${DEPLOY_GATE_SECRET_GUIDE}` };
+  const apiUrl = connectedApiUrl(process.env.SEAMSHIELD_API_URL, stored);
+  try {
+    const response = await fetch(`${apiUrl}/v1/projects/${encodeURIComponent(projectId)}/guard/policy`, {
+      headers: { accept: "application/json", "x-seamshield-server-key": serverKey },
+    });
+    if (response.status === 401 || response.status === 403) {
+      return { ...base, api_reachable: true, credential_accepted: false, detail: `The backend rejected this project credential (${response.status}). Reconnect the project or rotate its runtime server key in Console.` };
+    }
+    if (!response.ok) {
+      return { ...base, api_reachable: true, credential_accepted: null, detail: `${apiUrl} answered ${response.status}. The credential was not disproved; retry once the backend is healthy.` };
+    }
+    return { ...base, api_reachable: true, credential_accepted: true, detail: `Connected project verified against ${apiUrl}.` };
+  } catch (error) {
+    return { ...base, api_reachable: false, credential_accepted: null, detail: `Cannot reach ${apiUrl} (${error instanceof Error ? error.message : String(error)}). Check network access or --api-url; the local connection was not changed.` };
+  }
+}
+
+function buildDoctorReport(target: string, connected?: ConnectedDoctorReport) {
   const root = resolve(target);
   const configPath = join(root, ".seamshield", "config.yaml");
   const privacy = buildPrivacyReport(root);
@@ -2043,6 +2462,14 @@ function buildDoctorReport(target: string) {
     checks.package_homepage_ok,
     checks.offline_default,
     checks.rule_artifacts_clean,
+    // A repo that cannot be written to, or runs an unsupported Node, is not a
+    // healthy setup. These previously reported WARN while doctor exited 0.
+    checks.node_20_or_newer,
+    checks.writable_target,
+    // In --connected mode the enrollment must actually work, not merely exist.
+    ...(connected
+      ? [connected.connection_schema_valid, connected.project_id_present, connected.server_key_present, connected.credential_accepted !== false]
+      : []),
   ];
   return {
     schema: "seamshield.doctor/v1",
@@ -2063,9 +2490,11 @@ function buildDoctorReport(target: string) {
       ci: ciStatus,
       agent_context: agents,
       rule_artifacts: artifacts,
+      ...(connected ? { connected } : {}),
     },
     status: required.every(Boolean) ? "ok" : "needs_attention",
     next: [
+      ...(connected && connected.detail && (connected.credential_accepted !== true) ? [connected.detail] : []),
       ...(!checks.config_exists ? ["Run `seamshield config init .` to add local scanner config only."] : []),
       ...(!checks.guard_installed ? ["Run `seamshield guard install .` if this repo uses Claude Code."] : []),
       ...(!checks.ci_installed ? ["Run `seamshield ci install .` to add the Community offline ship check."] : []),
@@ -2102,6 +2531,16 @@ function renderDoctorTable(report: ReturnType<typeof buildDoctorReport>): string
     row("CI installed", report.checks.ci_installed),
     row("agent context present", report.checks.agent_context_any),
     row("rule artifacts clean", report.checks.rule_artifacts_clean),
+    ...(report.details.connected ? [
+      "",
+      "Connected setup:",
+      row("connection file readable", report.details.connected.connection_schema_valid),
+      row("project id present", report.details.connected.project_id_present),
+      row("runtime server key available", report.details.connected.server_key_present),
+      row("backend reachable", report.details.connected.api_reachable === true),
+      row("credential accepted", report.details.connected.credential_accepted === true),
+      row("deployment gate inputs ready", report.details.connected.deploy_gate_ready),
+    ] : []),
     "",
     "Next:",
     ...(report.next.length > 0 ? report.next.map((item) => `- ${item}`) : ["- No required Community health issues found."]),
@@ -2110,7 +2549,10 @@ function renderDoctorTable(report: ReturnType<typeof buildDoctorReport>): string
 
 function buildStatusReport(target: string) {
   const root = resolve(target);
-  const connection = readLocalConnection(root);
+  const stored = readLocalConnection(root);
+  // Never surface the persisted runtime server key: `status --format json` is
+  // routinely piped into logs, CI output, and support tickets.
+  const connection = stored ? { ...stored, server_key: undefined, server_key_present: Boolean(stored.server_key) } : stored;
   const configPath = join(root, ".seamshield", "config.yaml");
   const capabilities = collectInventory(root, { profile: "community" }).capabilities;
   const next = connection?.ci?.status === "configured" && connection.ci.provider === "github"
@@ -2133,6 +2575,168 @@ async function offlineExport(target: string, outPath?: string): Promise<string> 
   const root = resolve(target);
   const result = await scanAsync(root, { network: "off", failOn: "never", profile: "community" });
   return JSON.stringify({ schema: "seamshield.offline-handoff/v1", profile: "community", exported_at: new Date().toISOString(), scan: result, inventory: collectInventory(root, { profile: "community" }), source_upload: false, metadata_only: true }, null, 2);
+}
+
+// Onboarding spans six surfaces, each with its own command and its own partial
+// state. Users previously had to run `status`, `ci status`, `guard status`, and
+// `doctor --connected` and then infer where they actually were. `setup` answers
+// the only question that matters during onboarding: what do I run next.
+type SetupStageState = "done" | "pending";
+
+type SetupStage = {
+  id: string;
+  title: string;
+  state: SetupStageState;
+  required: boolean;
+  detail: string;
+  next_command?: string;
+};
+
+function repoRelative(root: string, path: string): string {
+  return path.startsWith(root) ? path.slice(root.length).replace(/^[/\\]/, "") : path;
+}
+
+function workflowTracked(root: string, path: string): boolean {
+  if (!existsSync(path)) return false;
+  const tracked = spawnSync("git", ["ls-files", "--error-unmatch", repoRelative(root, path)], { cwd: root, encoding: "utf8" });
+  return tracked.status === 0;
+}
+
+function authNodeInstalled(root: string): boolean {
+  const manifest = readJsonFile(join(root, "package.json"));
+  if (!manifest) return false;
+  const deps = { ...(manifest.dependencies as Record<string, unknown> || {}), ...(manifest.devDependencies as Record<string, unknown> || {}) };
+  return Object.keys(deps).includes("@seamshield/auth-node");
+}
+
+function buildSetupReport(target: string, connected?: ConnectedDoctorReport) {
+  const root = resolve(target);
+  const stored = readLocalConnection(root);
+  const ci = buildCiStatus(root);
+  const enrollment = readSentinelEnrollment(root);
+  const projectId = stored?.project?.id || "";
+  const serverKey = runtimeServerKey() || stored?.server_key || "";
+  const configExists = existsSync(join(root, ".seamshield", "config.yaml"));
+  const pushed = workflowTracked(root, ci.workflow_path);
+
+  const stages: SetupStage[] = [
+    {
+      id: "local_scan",
+      title: "Scan locally",
+      state: configExists ? "done" : "pending",
+      required: true,
+      detail: configExists ? "Local scanner config is present." : "No .seamshield/config.yaml yet.",
+      next_command: configExists ? undefined : "npx @seamshield/cli init .",
+    },
+    {
+      id: "project_connection",
+      title: "Connect the project",
+      state: projectId ? "done" : "pending",
+      required: true,
+      detail: projectId
+        ? `Connected as ${stored?.project?.name || projectId}.`
+        : "No stored project connection. Generate a one-time connection command in Console -> Build -> Platform.",
+      next_command: projectId ? undefined : "npx @seamshield/cli connect . --token ssconn_...",
+    },
+    {
+      id: "ci",
+      title: "Activate CI",
+      // A generated-but-uncommitted workflow never runs, so it is not "done".
+      state: ci.status === "installed" && pushed ? "done" : "pending",
+      required: true,
+      detail: ci.status !== "installed"
+        ? `No SeamShield workflow at ${repoRelative(root, ci.workflow_path)}.`
+        : pushed
+          ? `${ci.provider} workflow is committed; CI uses provider OIDC and needs no server key.`
+          : `${repoRelative(root, ci.workflow_path)} exists locally but is not committed, so it has never run.`,
+      next_command: ci.status !== "installed"
+        ? "npx @seamshield/cli ci install ."
+        : pushed ? undefined : `git add ${repoRelative(root, ci.workflow_path)} && git commit -m "ci: add SeamShield" && git push`,
+    },
+    {
+      id: "deploy_gate",
+      title: "Gate deployments",
+      state: projectId && serverKey ? "done" : "pending",
+      required: false,
+      detail: projectId && serverKey
+        ? "Both deployment-gate inputs are available locally; copy them into the deployment host secret store."
+        : DEPLOY_GATE_SECRET_GUIDE,
+      next_command: projectId && serverKey
+        ? "npx @seamshield/cli deploy-gate verify --environment production --commit \"$SEAMSHIELD_DEPLOY_COMMIT\" --branch \"$SEAMSHIELD_DEPLOY_BRANCH\""
+        : undefined,
+    },
+    {
+      id: "seamauth",
+      title: "Enforce a sensitive lane with SeamAuth",
+      state: authNodeInstalled(root) ? "done" : "pending",
+      required: false,
+      detail: authNodeInstalled(root)
+        ? "@seamshield/auth-node is a dependency. Verify at boot with diagnoseRuntimeConnection(process.env)."
+        : "Optional. SeamAuth adds a signed server-side decision after your own session check.",
+      next_command: authNodeInstalled(root) ? undefined : "npm install @seamshield/auth-node",
+    },
+    {
+      id: "sentinel",
+      title: "Observe runtime with Sentinel",
+      // Enrolling only writes a local id. Treating that as "done" is exactly
+      // what let a runtime sit silent while setup reported success, so this
+      // stage now requires an accepted observation.
+      state: enrollment?.runtime_id && enrollment?.last_observed_at ? "done" : "pending",
+      required: false,
+      detail: !enrollment?.runtime_id
+        ? "Optional. Enroll the runtime in Console, then export SEAMSHIELD_SENTINEL_KEY on the host."
+        : enrollment.last_observed_at
+          ? `Runtime ${enrollment.runtime_id} reported ${Number(enrollment.last_service_count || 0)} service(s) at ${enrollment.last_observed_at}.`
+          : `Runtime ${enrollment.runtime_id} is enrolled but has never reported. Sentinel must run on the server host, not in an application container.`,
+      next_command: !enrollment?.runtime_id
+        ? "npx @seamshield/cli sentinel enroll . --runtime-id runtime_..."
+        : enrollment.last_observed_at ? undefined : "npx @seamshield/cli sentinel preflight .",
+    },
+  ];
+
+  // A credential the backend rejects means the connection stage is not actually
+  // complete, however healthy the local file looks.
+  if (connected && connected.credential_accepted === false) {
+    const stage = stages.find((entry) => entry.id === "project_connection");
+    if (stage) {
+      stage.state = "pending";
+      stage.detail = connected.detail;
+      stage.next_command = "npx @seamshield/cli connect . --token ssconn_...";
+    }
+  }
+
+  const blocking = stages.filter((stage) => stage.required && stage.state === "pending");
+  const nextStage = blocking[0] || stages.find((stage) => stage.state === "pending");
+  return {
+    schema: "seamshield.setup/v1",
+    target: root,
+    stages,
+    required_complete: blocking.length === 0,
+    completed: stages.filter((stage) => stage.state === "done").length,
+    total: stages.length,
+    next: nextStage ? { stage: nextStage.id, detail: nextStage.detail, command: nextStage.next_command } : null,
+    ...(connected ? { connected } : {}),
+  };
+}
+
+function renderSetupTable(report: ReturnType<typeof buildSetupReport>): string {
+  const lines = [
+    "SeamShield Setup",
+    "",
+    `Target: ${report.target}`,
+    `Progress: ${report.completed}/${report.total} stages · required ${report.required_complete ? "complete" : "incomplete"}`,
+    "",
+  ];
+  for (const stage of report.stages) {
+    lines.push(`${stage.state === "done" ? "DONE" : stage.required ? "TODO" : "OPT "}  ${stage.title}`);
+    lines.push(`      ${stage.detail}`);
+    if (stage.next_command) lines.push(`      $ ${stage.next_command}`);
+  }
+  lines.push("");
+  lines.push(report.next
+    ? `Next: ${report.next.command || report.next.detail}`
+    : "Next: every stage is connected. Re-run `seamshield doctor . --connected` after any credential rotation.");
+  return lines.join("\n");
 }
 
 function offlineImport(target: string, file: string): string {
@@ -2242,7 +2846,12 @@ function installGuard(target: string): string {
     unknown
   >;
   const command = `${process.execPath} ${JSON.stringify(currentBin())} guard check`;
+  // Preserve any hooks the project already installed. Replacing the whole
+  // PreToolUse array silently deleted unrelated Claude Code hooks.
+  const existingPreToolUse = Array.isArray(hooks.PreToolUse) ? hooks.PreToolUse : [];
+  const foreign = existingPreToolUse.filter((entry) => !JSON.stringify(entry ?? null).includes("guard check"));
   hooks.PreToolUse = [
+    ...foreign,
     {
       matcher: "Write|Edit|MultiEdit|Bash",
       hooks: [{ type: "command", command }],
@@ -2257,11 +2866,54 @@ function guardPolicyPath(target: string): string {
   return join(resolve(target), ".seamshield", "guard-policy.json");
 }
 
+function guardDecisionSpoolPath(target: string): string {
+  return join(resolve(target), ".seamshield", "guard-decisions.jsonl");
+}
+
+type GuardDecisionRecord = {
+  decision: "allow" | "deny" | "warn";
+  tool: string;
+  risk: string;
+  rule_id: string;
+  reason: string;
+  path_hash: string | null;
+  path_extension: string | null;
+  decided_at: string;
+};
+
+// Guard decisions reference the file a coding agent tried to write. The
+// custody model for this product is metadata-only, so the spool records a
+// salted-free SHA-256 of the repository-relative path and its extension, and
+// never the path itself, the proposed content, or the command text.
+function guardDecisionReference(rel: string | null): { path_hash: string | null; path_extension: string | null } {
+  if (!rel) return { path_hash: null, path_extension: null };
+  const normalized = rel.replaceAll("\\", "/").replace(/^\.\//, "");
+  return {
+    path_hash: createHash("sha256").update(normalized).digest("hex").slice(0, 32),
+    path_extension: (extname(normalized) || "").slice(0, 16) || null,
+  };
+}
+
+// The hook must answer Claude Code quickly and must never fail an edit
+// because reporting is unavailable, so decisions are appended locally and
+// uploaded later by `seamshield guard report`.
+function recordGuardDecision(root: string, record: GuardDecisionRecord): void {
+  try {
+    const out = guardDecisionSpoolPath(root);
+    mkdirSync(dirname(out), { recursive: true });
+    writeFileSync(out, `${JSON.stringify(record)}\n`, { flag: "a" });
+  } catch {
+    // Never block an edit because the local spool is unavailable.
+  }
+}
+
 async function syncGuardPolicy(target: string, projectId: string, apiUrl: string): Promise<string> {
-  const serverKey = process.env.SEAMSHIELD_SERVER_KEY;
-  if (!serverKey) throw new Error("SEAMSHIELD_SERVER_KEY is required for guard sync");
-  if (!projectId) throw new Error("SEAMSHIELD_PROJECT_ID is required for guard sync");
-  const response = await fetch(`${apiUrl.replace(/\/$/, "")}/v1/projects/${encodeURIComponent(projectId)}/guard/policy`, {
+  const stored = readLocalConnection(resolve(target));
+  const resolvedProjectId = projectId || stored?.project.id || "";
+  const serverKey = runtimeServerKey() || stored?.server_key || "";
+  if (!serverKey) throw new Error(`SEAMSHIELD_SERVER_KEY is required for guard sync. ${DEPLOY_GATE_SECRET_GUIDE}`);
+  if (!resolvedProjectId) throw new Error(`SEAMSHIELD_PROJECT_ID is required for guard sync. ${DEPLOY_GATE_SECRET_GUIDE}`);
+  const response = await fetch(`${connectedApiUrl(apiUrl, stored)}/v1/projects/${encodeURIComponent(resolvedProjectId)}/guard/policy`, {
     headers: { accept: "application/json", "x-seamshield-server-key": serverKey },
   });
   const body = await response.json().catch(() => ({}));
@@ -2280,6 +2932,42 @@ function readJsonFile(path: string): Record<string, unknown> | null {
   } catch {
     return null;
   }
+}
+
+// Guard enforced locally and reported nothing, so the Console could never show
+// whether the control was actually running. Upload the spooled decisions as a
+// bounded, metadata-only batch and clear only what the backend accepted.
+async function reportGuardDecisions(target: string, projectId: string, apiUrl: string): Promise<{ reported: number; receipt_digest: string | null }> {
+  const root = resolve(target);
+  const stored = readLocalConnection(root);
+  const resolvedProjectId = projectId || process.env.SEAMSHIELD_PROJECT_ID || stored?.project.id || "";
+  const serverKey = runtimeServerKey() || stored?.server_key || "";
+  if (!resolvedProjectId) throw new Error(`SEAMSHIELD_PROJECT_ID is required to report Guard decisions. ${DEPLOY_GATE_SECRET_GUIDE}`);
+  if (!serverKey) throw new Error(`SEAMSHIELD_SERVER_KEY is required to report Guard decisions. ${DEPLOY_GATE_SECRET_GUIDE}`);
+  const spool = guardDecisionSpoolPath(root);
+  if (!existsSync(spool)) return { reported: 0, receipt_digest: null };
+  const decisions = readFileSync(spool, "utf8")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => { try { return JSON.parse(line) as Record<string, unknown>; } catch { return null; } })
+    .filter((item): item is Record<string, unknown> => item !== null)
+    .slice(-500);
+  if (decisions.length === 0) return { reported: 0, receipt_digest: null };
+  const response = await fetch(`${connectedApiUrl(apiUrl, stored)}/v1/projects/${encodeURIComponent(resolvedProjectId)}/guard/decisions`, {
+    method: "POST",
+    headers: { "content-type": "application/json", accept: "application/json", "x-seamshield-server-key": serverKey },
+    body: JSON.stringify({
+      idempotency_key: createHash("sha256").update(decisions.map((item) => JSON.stringify(item)).join("\n")).digest("hex").slice(0, 40),
+      decisions,
+    }),
+  });
+  const body = await response.json().catch(() => ({})) as { error?: string; guard_decision_receipt?: { digest?: string } };
+  if (!response.ok || !body.guard_decision_receipt) throw new Error(String(body.error || `guard_decisions_${response.status}`));
+  // Only clear after the backend confirms custody, so a failed upload never
+  // silently discards evidence of what Guard did.
+  writeFileSync(spool, "");
+  return { reported: decisions.length, receipt_digest: body.guard_decision_receipt.digest || null };
 }
 
 function buildGuardStatus(target: string) {
@@ -2399,14 +3087,48 @@ function bashDecision(command: string): string | null {
   return null;
 }
 
+type GuardPolicyControls = { block: string[]; warn: string[] };
+
+// The signed project policy was downloaded and cached but never consulted, so
+// Guard always enforced only the bundled scanner. Policy risks are applied as
+// a union with the bundled verdict: a policy can add blocked risks, never
+// weaken an existing block.
+function activeGuardPolicy(root: string): { version: string; controls: GuardPolicyControls } | null {
+  const policy = readJsonFile(guardPolicyPath(root));
+  if (!policy || policy.schema !== "seamshield.guard-policy/v1" || typeof policy.digest !== "string" || !policy.digest) return null;
+  const controls = policy.controls && typeof policy.controls === "object" ? policy.controls as Record<string, unknown> : {};
+  return {
+    version: typeof policy.version === "string" ? policy.version : "unknown",
+    controls: {
+      block: Array.isArray(controls.block) ? controls.block.map(String) : [],
+      warn: Array.isArray(controls.warn) ? controls.warn.map(String) : [],
+    },
+  };
+}
+
 function guardCheck(): void {
+  const root = process.cwd();
+  const emit = (payload: unknown, record: GuardDecisionRecord) => {
+    recordGuardDecision(root, record);
+    console.log(JSON.stringify(payload));
+  };
   try {
     const parsed = JSON.parse(readStdin()) as Record<string, unknown>;
     const { tool, raw } = extractToolPayload(parsed);
     if (/Bash/.test(tool)) {
       const command = String(raw.command ?? "");
       const deny = bashDecision(command);
-      console.log(JSON.stringify(deny ? hookDeny(deny) : hookAllow()));
+      // The command text itself is never recorded; only the rule that fired.
+      emit(deny ? hookDeny(deny) : hookAllow(), {
+        decision: deny ? "deny" : "allow",
+        tool: "Bash",
+        risk: deny ? "dependency_to_shell" : "none",
+        rule_id: deny ? deny.split(":")[0] : "",
+        reason: deny ? deny.slice(0, 240) : "",
+        path_hash: null,
+        path_extension: null,
+        decided_at: new Date().toISOString(),
+      });
       return;
     }
     const proposed = contentFromTool(tool, raw);
@@ -2414,12 +3136,21 @@ function guardCheck(): void {
       console.log(JSON.stringify(hookAllow()));
       return;
     }
+    const ref = guardDecisionReference(proposed.rel);
     const tempRoot = mkdtempSync(join(tmpdir(), "seamshield-guard-"));
     const abs = resolve(tempRoot, proposed.rel);
     const tempRelative = relative(tempRoot, abs);
     if (!tempRelative || tempRelative.startsWith("..") || resolve(tempRoot, tempRelative) !== abs) {
       rmSync(tempRoot, { recursive: true, force: true });
-      console.log(JSON.stringify(hookDeny("ss/guard/unsafe-file-path: proposed edit path must remain inside the Guard sandbox.")));
+      emit(hookDeny("ss/guard/unsafe-file-path: proposed edit path must remain inside the Guard sandbox."), {
+        decision: "deny",
+        tool,
+        risk: "unsafe_file_path",
+        rule_id: "ss/guard/unsafe-file-path",
+        reason: "proposed edit path must remain inside the Guard sandbox",
+        ...ref,
+        decided_at: new Date().toISOString(),
+      });
       return;
     }
     mkdirSync(dirname(abs), { recursive: true });
@@ -2428,14 +3159,57 @@ function guardCheck(): void {
     rmSync(tempRoot, { recursive: true, force: true });
     const block = result.findings.find((f: Finding) => f.finding.severity === "block");
     if (block) {
-      console.log(
-        JSON.stringify(
-          hookDeny(`${block.finding.rule_id}: ${block.finding.title}. ${block.finding.fix.summary}`),
-        ),
-      );
+      emit(hookDeny(`${block.finding.rule_id}: ${block.finding.title}. ${block.finding.fix.summary}`), {
+        decision: "deny",
+        tool,
+        risk: "scanner_block",
+        rule_id: block.finding.rule_id,
+        reason: String(block.finding.title).slice(0, 240),
+        ...ref,
+        decided_at: new Date().toISOString(),
+      });
       return;
     }
-    console.log(JSON.stringify(hookAllow()));
+    const policy = activeGuardPolicy(process.cwd());
+    if (policy && policy.controls.block.length > 0) {
+      const blockedRisks = new Set(policy.controls.block);
+      const lane = buildAccessMap(result).lanes.find((item) => blockedRisks.has(item.risk));
+      if (lane) {
+        emit(hookDeny(`ss/guard/policy-blocked-risk: ${lane.risk} is blocked by signed project Guard policy (${policy.version}). ${lane.fix.summary}`), {
+          decision: "deny",
+          tool,
+          risk: String(lane.risk),
+          rule_id: "ss/guard/policy-blocked-risk",
+          reason: `blocked by signed project Guard policy (${policy.version})`,
+          ...ref,
+          decided_at: new Date().toISOString(),
+        });
+        return;
+      }
+      const warnRisks = new Set(policy.controls.warn);
+      const warned = buildAccessMap(result).lanes.find((item) => warnRisks.has(item.risk));
+      if (warned) {
+        emit(hookAllow(`SeamShield Guard policy (${policy.version}) flags ${warned.risk} on this edit: ${warned.fix.summary}`), {
+          decision: "warn",
+          tool,
+          risk: String(warned.risk),
+          rule_id: "ss/guard/policy-warned-risk",
+          reason: `flagged for review by signed project Guard policy (${policy.version})`,
+          ...ref,
+          decided_at: new Date().toISOString(),
+        });
+        return;
+      }
+    }
+    emit(hookAllow(), {
+      decision: "allow",
+      tool,
+      risk: "none",
+      rule_id: "",
+      reason: "",
+      ...ref,
+      decided_at: new Date().toISOString(),
+    });
   } catch (error) {
     const logPath = join(process.cwd(), ".seamshield", "guard.log");
     try {
@@ -2734,7 +3508,7 @@ program
   .option("--ci-audience <audience>", "provider OIDC audience for Bitbucket, Azure, CircleCI, or generic CI")
   .option("--offline", "skip network-backed dependency intelligence")
   .action(async (path: string, opts: { projectId?: string; token?: string; apiUrl?: string; offline?: boolean; ciProvider?: string; ciRepositoryId?: string; ciIssuer?: string; ciJwksUri?: string; ciAudience?: string }) => {
-    process.exitCode = await connectProject(resolve(path), opts);
+    process.exitCode = await runConnectCommand("connect", resolve(path), opts);
   });
 
 program
@@ -2747,7 +3521,7 @@ program
   .option("--ci-provider <provider>", "CI provider override", process.env.SEAMSHIELD_CI_PROVIDER)
   .option("--ci-audience <audience>", "provider OIDC audience", process.env.SEAMSHIELD_CI_AUDIENCE)
   .action(async (path: string, opts: { apiUrl?: string; offline?: boolean; ci?: boolean; ciProvider?: string; ciAudience?: string }) => {
-    process.exitCode = await connectProject(resolve(path), opts);
+    process.exitCode = await runConnectCommand("sync", resolve(path), opts);
   });
 
 const sentinel = program
@@ -2786,8 +3560,10 @@ sentinel
   .argument("[path]", "directory holding the protected project connection", ".")
   .option("--api-url <url>", "SeamShield backend base URL", process.env.SEAMSHIELD_API_URL || DEFAULT_CONNECTED_API_URL)
   .option("--edge-attachment-id <id...>", "opaque Sentinel edge attachment id from the Console")
-  .action(async (path: string, opts: { apiUrl?: string; edgeAttachmentId?: string[] }) => {
-    process.exitCode = await observeCloudflare(resolve(path), { apiUrl: opts.apiUrl, edgeAttachmentIds: opts.edgeAttachmentId });
+  .option("--discover", "print the opaque zone references the Console edge attachment form asks for")
+  .option("--zone-ref <ref...>", "opaque zone reference(s) to observe; required when the token reads more than one zone")
+  .action(async (path: string, opts: { apiUrl?: string; edgeAttachmentId?: string[]; discover?: boolean; zoneRef?: string[] }) => {
+    process.exitCode = await observeCloudflare(resolve(path), { apiUrl: opts.apiUrl, edgeAttachmentIds: opts.edgeAttachmentId, discover: opts.discover, zoneRefs: opts.zoneRef });
   });
 
 sentinel
@@ -2796,6 +3572,23 @@ sentinel
   .argument("[path]", "directory holding the protected project connection", ".")
   .action((path: string) => {
     process.exitCode = installSentinelSchedule(resolve(path));
+  });
+
+sentinel
+  .command("preflight")
+  .description("Check every Sentinel precondition without recording an observation")
+  .argument("[path]", "directory holding the protected project connection", ".")
+  .option("--api-url <url>", "SeamShield backend base URL", process.env.SEAMSHIELD_API_URL || DEFAULT_CONNECTED_API_URL)
+  .option("--runtime-id <id>", "opaque tenant-scoped Sentinel runtime id", process.env.SEAMSHIELD_SENTINEL_RUNTIME_ID)
+  .option("--environment <name>", "deployment environment label", process.env.SEAMSHIELD_ENVIRONMENT || "production")
+  .option("--format <format>", "table | json", "table")
+  .action(async (path: string, opts: { apiUrl?: string; runtimeId?: string; environment?: string; format?: string }) => {
+    try {
+      process.exitCode = await sentinelPreflight(resolve(path), opts);
+    } catch (error) {
+      console.error(`seamshield sentinel preflight: ${error instanceof Error ? error.message : String(error)}`);
+      process.exitCode = 1;
+    }
   });
 
 program
@@ -2843,13 +3636,18 @@ program
 
 program
   .command("learn")
-  .description("Update local controls from vulnerability intelligence without uploading source")
+  .description("Report local control-update availability (rule/control bundles are not available in this release)")
   .option("--source <path-or-url>", "future rule/control bundle source")
   .action((opts: { source?: string }) => {
     console.log("SeamShield Learn");
     console.log("Status: local rule/control updates are not wired yet.");
     console.log("Privacy: no source code was read or uploaded.");
-    if (opts.source) console.log(`Requested source: ${opts.source}`);
+    if (opts.source) {
+      // Exiting 0 here told scripts a requested bundle had been applied.
+      console.error(`seamshield learn: control bundles are not available in this release, so ${opts.source} was not applied. No local controls were updated.`);
+      process.exitCode = 2;
+      return;
+    }
     process.exitCode = 0;
   });
 
@@ -2908,19 +3706,42 @@ program
 
 program
   .command("doctor")
-  .description("Run a local Community SeamShield health check")
+  .description("Run a SeamShield health check; --connected also verifies the stored enrollment against the backend")
   .argument("[path]", "project directory", ".")
   .option("--format <format>", "output format: table | json", "table")
-  .action((path: string, opts: { format: string }) => {
+  .option("--connected", "verify the stored project connection, credential, and deployment-gate inputs")
+  .action(async (path: string, opts: { format: string; connected?: boolean }) => {
     if (!assertChoice(opts.format, STATUS_FORMATS, "format")) return;
     if (!existsSync(path)) {
       console.error(`seamshield: path not found: ${path}`);
       process.exitCode = 2;
       return;
     }
-    const report = buildDoctorReport(path);
+    const connected = opts.connected ? await verifyConnectedSetup(resolve(path)) : undefined;
+    const report = buildDoctorReport(path, connected);
     console.log(opts.format === "json" ? `${JSON.stringify(report, null, 2)}\n` : renderDoctorTable(report));
     process.exitCode = report.status === "ok" ? 0 : 1;
+  });
+
+program
+  .command("setup")
+  .description("Show every onboarding stage and the exact next command; --connected also verifies the stored credential")
+  .argument("[path]", "project directory", ".")
+  .option("--format <format>", "output format: table | json", "table")
+  .option("--connected", "verify the stored project connection against the backend")
+  .action(async (path: string, opts: { format: string; connected?: boolean }) => {
+    if (!assertChoice(opts.format, STATUS_FORMATS, "format")) return;
+    if (!existsSync(path)) {
+      console.error(`seamshield: path not found: ${path}`);
+      process.exitCode = 2;
+      return;
+    }
+    const connected = opts.connected ? await verifyConnectedSetup(resolve(path)) : undefined;
+    const report = buildSetupReport(path, connected);
+    console.log(opts.format === "json" ? `${JSON.stringify(report, null, 2)}\n` : renderSetupTable(report));
+    // Exit non-zero while a required stage is still incomplete so this is
+    // usable as an onboarding gate in scripts.
+    process.exitCode = report.required_complete ? 0 : 1;
   });
 
 const release = program
@@ -3016,7 +3837,7 @@ guard
   .command("sync")
   .description("Fetch a signed metadata-only project Guard policy")
   .argument("[path]", "project directory", ".")
-  .requiredOption("--project-id <id>", "SeamShield project id (or SEAMSHIELD_PROJECT_ID)", process.env.SEAMSHIELD_PROJECT_ID)
+  .option("--project-id <id>", "SeamShield project id (defaults to SEAMSHIELD_PROJECT_ID or the stored connection)", process.env.SEAMSHIELD_PROJECT_ID)
   .option("--api-url <url>", "SeamShield backend base URL", process.env.SEAMSHIELD_API_URL || "")
   .action(async (path: string, opts: { projectId?: string; apiUrl: string }) => {
     try {
@@ -3025,6 +3846,26 @@ guard
       process.exitCode = 0;
     } catch (error) {
       console.error(`seamshield: guard sync failed: ${error instanceof Error ? error.message : String(error)}`);
+      process.exitCode = 2;
+    }
+  });
+
+guard
+  .command("report")
+  .description("Upload spooled metadata-only Guard decisions so the Console can show what Guard enforced")
+  .argument("[path]", "project directory", ".")
+  .option("--project-id <id>", "SeamShield project id (defaults to SEAMSHIELD_PROJECT_ID or the stored connection)", process.env.SEAMSHIELD_PROJECT_ID)
+  .option("--api-url <url>", "SeamShield backend base URL", process.env.SEAMSHIELD_API_URL || "")
+  .action(async (path: string, opts: { projectId?: string; apiUrl: string }) => {
+    try {
+      if (!existsSync(path)) throw new Error(`path not found: ${path}`);
+      const result = await reportGuardDecisions(path, opts.projectId || "", opts.apiUrl);
+      console.log(result.reported === 0
+        ? "no spooled Guard decisions to report"
+        : `reported ${result.reported} Guard decision(s); receipt ${result.receipt_digest ?? "unknown"}`);
+      process.exitCode = 0;
+    } catch (error) {
+      console.error(`seamshield: guard report failed: ${error instanceof Error ? error.message : String(error)}`);
       process.exitCode = 2;
     }
   });
@@ -3051,6 +3892,16 @@ ci
     }
     const connection = readLocalConnection(target);
     if (!connection?.project.id) {
+      // Community (unconnected) mode only generates a GitHub workflow. Refuse
+      // when a different provider is positively detected, instead of silently
+      // writing GitHub Actions into a GitLab/Azure/Bitbucket/CircleCI repo.
+      const provider = detectCiProvider(target, opts.provider);
+      if (provider !== "github" && provider !== "generic") {
+        console.error(`seamshield ci install: detected ${provider}, but the unconnected Community ship check is only generated for GitHub Actions. Connect the project with \`seamshield connect . --token ssconn_...\` to install the ${provider} pipeline, or pass --provider github to write the GitHub workflow anyway.`);
+        process.exitCode = 2;
+        return;
+      }
+      if (provider === "generic") console.error("seamshield ci install: no CI provider detected; writing the GitHub Actions Community ship check. Pass --provider to choose another provider after connecting the project.");
       console.log(writeGithubAction(target));
       process.exitCode = 0;
     } else {
@@ -3102,6 +3953,50 @@ deploymentGate
       console.error(`seamshield: ${error instanceof Error ? error.message : String(error)}`);
       process.exitCode = 1;
     }
+  });
+
+deploymentGate
+  .command("env")
+  .description("Print the deployment-gate host secrets as export lines, so they are not hand-copied out of connection.json")
+  .argument("[path]", "project directory", ".")
+  .option("--format <format>", "output format: shell | json", "shell")
+  .option("--reveal", "include the private server key value; omitted by default so the output is safe to paste into a terminal")
+  .action((path: string, opts: { format: string; reveal?: boolean }) => {
+    if (!assertChoice(opts.format, ["shell", "json"], "format")) return;
+    if (!existsSync(path)) {
+      console.error(`seamshield: path not found: ${path}`);
+      process.exitCode = 2;
+      return;
+    }
+    const stored = readLocalConnection(resolve(path));
+    const projectId = process.env.SEAMSHIELD_PROJECT_ID || stored?.project.id || "";
+    const serverKey = runtimeServerKey() || stored?.server_key || "";
+    const apiUrl = connectedApiUrl(process.env.SEAMSHIELD_API_URL, stored);
+    if (!projectId || !serverKey) {
+      // Reporting "present" while refusing to emit the value is what forced
+      // hosts to open connection.json by hand in the first place.
+      console.error(`seamshield deploy-gate env: no stored deployment-gate credential. Run \`seamshield connect . --token ssconn_...\` first. ${DEPLOY_GATE_SECRET_GUIDE}`);
+      process.exitCode = 2;
+      return;
+    }
+    const redacted = "<reveal with --reveal>";
+    if (opts.format === "json") {
+      console.log(`${JSON.stringify({
+        schema: "seamshield.deploy-gate-env/v1",
+        SEAMSHIELD_API_URL: apiUrl,
+        SEAMSHIELD_PROJECT_ID: projectId,
+        SEAMSHIELD_SERVER_KEY: opts.reveal ? serverKey : redacted,
+        server_key_revealed: Boolean(opts.reveal),
+      }, null, 2)}\n`);
+    } else {
+      console.log([
+        `export SEAMSHIELD_API_URL=${shellQuote(apiUrl)}`,
+        `export SEAMSHIELD_PROJECT_ID=${shellQuote(projectId)}`,
+        `export SEAMSHIELD_SERVER_KEY=${opts.reveal ? shellQuote(serverKey) : shellQuote(redacted)}`,
+      ].join("\n"));
+    }
+    if (!opts.reveal) console.error("seamshield deploy-gate env: server key withheld; re-run with --reveal to emit it into a host secret store.");
+    process.exitCode = 0;
   });
 
 program.parse();
