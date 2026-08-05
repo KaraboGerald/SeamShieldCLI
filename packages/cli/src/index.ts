@@ -3981,20 +3981,25 @@ ci
         // it without a trust anchor produces a pipeline that looks fully
         // configured and then fails its first run. Bind now while the server
         // key is in hand rather than leaving a green status that lies.
+        //
+        // Binding is advisory and must never change the exit code. Writing the
+        // workflow and binding the anchor are separate outcomes: the operator
+        // frequently installs CI on a machine that holds no server key, and
+        // failing the install there deleted nothing, fixed nothing, and made a
+        // successful write look like a broken command. Say loudly what is not
+        // bound and which command binds it, then let the exit code continue to
+        // report whether the workflow itself was installed.
         const apiUrl = connectedApiUrl(process.env.SEAMSHIELD_API_URL, connection);
         const serverKey = runtimeServerKey() || connection.server_key || "";
         if (!serverKey) {
-          console.error(`seamshield ci install: no ${plan.provider} OIDC trust anchor could be bound because no project server key is available. CI will fail with ci_binding_not_found until you re-run this with SEAMSHIELD_SERVER_KEY set.`);
-          process.exitCode = 2;
-          return;
-        }
-        const anchor = await bindCiTrustAnchor(apiUrl, connection.project.id, serverKey, plan.binding);
-        if (anchor.bound) {
-          console.log(`${plan.provider} OIDC trust anchor bound to ${plan.binding.repository} (receipt ${anchor.detail.slice(0, 18)})`);
+          console.error(`seamshield ci install: the ${plan.provider} workflow was written, but no OIDC trust anchor could be bound because no project server key is available. CI will fail with ci_binding_not_found until you re-run this with SEAMSHIELD_SERVER_KEY set (or \`seamshield connect . --token ssconn_...\`).`);
         } else {
-          console.error(`seamshield ci install: the workflow was written but the ${plan.provider} OIDC trust anchor was not bound: ${anchor.detail}`);
-          process.exitCode = 2;
-          return;
+          const anchor = await bindCiTrustAnchor(apiUrl, connection.project.id, serverKey, plan.binding);
+          if (anchor.bound) {
+            console.log(`${plan.provider} OIDC trust anchor bound to ${plan.binding.repository} (receipt ${anchor.detail.slice(0, 18)})`);
+          } else {
+            console.error(`seamshield ci install: the ${plan.provider} workflow was written, but its OIDC trust anchor was not bound: ${anchor.detail}. CI will fail with ci_binding_not_found until this is re-run with SEAMSHIELD_SERVER_KEY set.`);
+          }
         }
       }
       process.exitCode = installed.status === "configured" ? 0 : 2;
