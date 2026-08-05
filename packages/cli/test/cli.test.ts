@@ -672,6 +672,41 @@ describe("seamshield scan (built CLI)", () => {
     expect(readFileSync(join(circle, ".circleci", "config.yml"), "utf8")).toContain("SEAMSHIELD_CI_PROVIDER: circleci");
   });
 
+  it("prefers the git remote over a legacy provider config file", () => {
+    // A stale `.circleci/config.yml` used to win outright on filesystem order,
+    // so a GitHub repository reported `circleci` and `ci install` would have
+    // written automation into a file GitHub Actions never reads.
+    const dir = tempProject();
+    spawnSync("git", ["init"], { cwd: dir });
+    spawnSync("git", ["remote", "add", "origin", "https://github.com/acme/widget.git"], { cwd: dir });
+    mkdirSync(join(dir, ".circleci"), { recursive: true });
+    // Mentions the CLI as a build dependency, but carries no generated
+    // SeamShield automation, so it must not count as proof of wiring.
+    writeFileSync(join(dir, ".circleci", "config.yml"), [
+      "version: 2.1",
+      "jobs:",
+      "  build:",
+      "    steps:",
+      "      - run: pnpm --filter @seamshield/cli... run build",
+      "",
+    ].join("\n"));
+
+    const status = JSON.parse(runCli(["ci", "status", dir, "--format", "json"]).stdout);
+    expect(status.provider).toBe("github");
+
+    // A config that does carry generated automation still wins, because it is
+    // direct evidence of the provider this project is actually wired to.
+    writeFileSync(join(dir, ".circleci", "config.yml"), [
+      "version: 2.1",
+      "jobs:",
+      "  seamshield:",
+      "    steps:",
+      "      - run: npx @seamshield/cli sync . --ci --offline",
+      "",
+    ].join("\n"));
+    expect(JSON.parse(runCli(["ci", "status", dir, "--format", "json"]).stdout).provider).toBe("circleci");
+  });
+
   it("does not let repo-local connection state redirect CI credentials", () => {
     const dir = tempProject();
     spawnSync("git", ["init"], { cwd: dir });

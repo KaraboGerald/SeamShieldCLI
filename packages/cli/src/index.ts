@@ -1639,19 +1639,54 @@ function remoteRepository(remote: string): { host: string; path: string } | null
   return { host: match[1].toLowerCase(), path: match[2].replace(/^\/+|\/+$/g, "") };
 }
 
+// Config-file presence used to win outright, so a single legacy
+// `.circleci/config.yml` left in a GitHub repository made every CI command
+// target CircleCI: `ci status` reported the wrong provider, and `ci install`
+// would have written the workflow to a file the repository's real CI never
+// reads. Rank by evidence strength instead of by filesystem order.
+//
+//   1. explicit override
+//   2. a provider file that already carries SeamShield automation
+//   3. the git remote host, which decides what CI can actually run
+//   4. a bare provider config file, which may be legacy or unused
+function providerConfigPaths(target: string): Array<{ provider: CiProvider; path: string }> {
+  return [
+    { provider: "github", path: join(target, ".github", "workflows", "seamshield.yml") },
+    { provider: "circleci", path: join(target, ".circleci", "config.yml") },
+    { provider: "azure", path: join(target, "azure-pipelines.yml") },
+    { provider: "bitbucket", path: join(target, "bitbucket-pipelines.yml") },
+    { provider: "gitlab", path: join(target, ".gitlab-ci.yml") },
+  ];
+}
+
+function remoteHostProvider(target: string): CiProvider | null {
+  const remote = remoteRepository(gitRemote(target));
+  if (!remote) return null;
+  if (remote.host === "github.com") return "github";
+  if (remote.host === "gitlab.com") return "gitlab";
+  if (remote.host === "bitbucket.org") return "bitbucket";
+  if (remote.host === "dev.azure.com" || remote.host.endsWith(".visualstudio.com")) return "azure";
+  return null;
+}
+
 function detectCiProvider(target: string, override?: string): CiProvider {
   if (override && ["github", "gitlab", "bitbucket", "azure", "circleci", "generic"].includes(override)) return override as CiProvider;
-  if (existsSync(join(target, ".circleci", "config.yml"))) return "circleci";
-  if (existsSync(join(target, "azure-pipelines.yml"))) return "azure";
-  if (existsSync(join(target, "bitbucket-pipelines.yml"))) return "bitbucket";
-  if (existsSync(join(target, ".gitlab-ci.yml"))) return "gitlab";
-  if (existsSync(join(target, ".github", "workflows", "seamshield.yml"))) return "github";
-  const remote = remoteRepository(gitRemote(target));
-  if (remote?.host === "github.com") return "github";
-  if (remote?.host === "gitlab.com") return "gitlab";
-  if (remote?.host === "bitbucket.org") return "bitbucket";
-  if (remote?.host === "dev.azure.com" || remote?.host.endsWith(".visualstudio.com")) return "azure";
-  return "generic";
+  const candidates = providerConfigPaths(target).filter((candidate) => existsSync(candidate.path));
+  // A file that already runs the SeamShield CLI is the strongest signal there
+  // is: that provider is demonstrably the one wired to this project.
+  for (const candidate of candidates) {
+    try {
+      // Match only the commands `ci install` generates. A looser match on
+      // `@seamshield/cli` also matches this monorepo's own build steps, which
+      // is how a legacy CircleCI config kept winning in the SeamShield repo.
+      if (/seamshield\/cli (ship|sync) \.|seamshield (ship|sync) \. --(offline|ci)/.test(readFileSync(candidate.path, "utf8"))) return candidate.provider;
+    } catch { /* Unreadable config cannot prove anything. */ }
+  }
+  // The remote host decides which CI service can run at all, so it outranks a
+  // config file that may simply have been left behind.
+  const remoteProvider = remoteHostProvider(target);
+  if (remoteProvider) return remoteProvider;
+  return candidates[0]?.provider || "generic";
 }
 
 function buildCiPlan(target: string, options: { ciProvider?: string; ciRepositoryId?: string; ciIssuer?: string; ciJwksUri?: string; ciAudience?: string }): CiPlan {
