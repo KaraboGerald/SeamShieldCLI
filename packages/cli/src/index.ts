@@ -1970,7 +1970,7 @@ async function verifyDeploymentGate(options: { projectId?: string; commit?: stri
 // user always gets a cause and a next action instead of a stack trace.
 async function runConnectCommand(label: "connect" | "sync", target: string, options: Parameters<typeof connectProject>[1]): Promise<number> {
   try {
-    return await connectProject(target, options);
+    return await connectProject(target, { ...options, label });
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
     const cause = error instanceof Error && error.cause instanceof Error ? ` (${error.cause.message})` : "";
@@ -1987,7 +1987,7 @@ async function runConnectCommand(label: "connect" | "sync", target: string, opti
   }
 }
 
-async function connectProject(target: string, options: { projectId?: string; token?: string; apiUrl?: string; offline?: boolean; ci?: boolean; ciProvider?: string; ciRepositoryId?: string; ciIssuer?: string; ciJwksUri?: string; ciAudience?: string }): Promise<number> {
+async function connectProject(target: string, options: { projectId?: string; token?: string; apiUrl?: string; offline?: boolean; ci?: boolean; ciProvider?: string; ciRepositoryId?: string; ciIssuer?: string; ciJwksUri?: string; ciAudience?: string; label?: "connect" | "sync" }): Promise<number> {
   const startedAt = Date.now();
   const stored = readLocalConnection(target);
   const projectId = options.projectId || process.env.SEAMSHIELD_PROJECT_ID || stored?.project.id || "";
@@ -1995,7 +1995,21 @@ async function connectProject(target: string, options: { projectId?: string; tok
   const connectionToken = options.token || "";
   const apiUrl = connectedApiUrl(options.apiUrl || process.env.SEAMSHIELD_API_URL, stored);
   if (!connectionToken && (!projectId || (!serverKey && !options.ci))) {
-    console.error("seamshield connect: run the one-time Platform connection command first");
+    // This used to say "run the one-time Platform connection command first"
+    // under the hardcoded `connect` label, even when invoked as `sync` from a
+    // release gate. In CI there is no interactive connect step and no local
+    // connection file, so the advice named a command the operator could not
+    // run and hid the real cause: an unset credential in the protected
+    // context. Name the exact missing variables and stay label-correct.
+    const missing = [
+      ...(projectId ? [] : ["SEAMSHIELD_PROJECT_ID"]),
+      ...(serverKey || options.ci ? [] : ["SEAMSHIELD_SERVER_KEY"]),
+    ];
+    if (options.label === "sync") {
+      console.error(`seamshield sync: ${missing.join(" and ")} ${missing.length > 1 ? "are" : "is"} not set, so this run has no project identity. In CI, set ${missing.join(" and ")} in the protected context or environment holding the release-gate secrets. Locally, run \`seamshield connect . --token ssconn_...\` once instead. The local connection was left unchanged.`);
+    } else {
+      console.error(`seamshield connect: run the one-time Platform connection command first (\`seamshield connect . --token ssconn_...\`), or set ${missing.join(" and ")} for a non-interactive connect.`);
+    }
     return 2;
   }
   if (!existsSync(target)) {
