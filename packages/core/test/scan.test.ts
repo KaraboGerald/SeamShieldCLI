@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -126,6 +127,24 @@ describe("scan of the seeded fixture", () => {
 
   it("does not flag .env.example", () => {
     expect(result.findings.some((f) => f.finding.file === ".env.example")).toBe(false);
+  });
+
+  it("treats suffixed template names as templates but still flags real dotenv files", () => {
+    const dir = makeTempDir("seamshield-env-template-");
+    spawnSync("git", ["init", "-q", dir], { encoding: "utf8" });
+    writeFileSync(join(dir, ".env.deploy-verify.example"), "TOKEN=<placeholder>\n");
+    writeFileSync(join(dir, ".env.staging.sample"), "TOKEN=<placeholder>\n");
+    writeFileSync(join(dir, ".env"), "TOKEN=<placeholder>\n");
+    writeFileSync(join(dir, ".env.local"), "TOKEN=<placeholder>\n");
+    // A user's global core.excludesFile may hide untracked dotenv files, so
+    // stage them: tracked files are the case the rule actually cares about.
+    spawnSync("git", ["-C", dir, "add", "-f", "-A"], { encoding: "utf8" });
+
+    const flagged = scan(dir)
+      .findings.filter((f) => f.finding.rule_id === "ss/secrets/env-file-committed")
+      .map((f) => f.finding.file)
+      .sort();
+    expect(flagged).toEqual([".env", ".env.local"]);
   });
 
   it("does not scan files ignored by .gitignore", () => {
