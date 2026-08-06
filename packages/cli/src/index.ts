@@ -3621,7 +3621,7 @@ program
 async function enrollProject(target: string, link: string, options: { apiUrl?: string; offline?: boolean; agentLabel?: string; requestCiApproval?: boolean }): Promise<number> {
   let parsedLink: URL;
   try { parsedLink = new URL(link); } catch { console.error("seamshield enroll: expected an enrollment link such as https://platform.seamshield.com/e/ssenroll_..."); return 2; }
-  if (!/^\/e\/ssenroll_[a-zA-Z0-9_-]+$/.test(parsedLink.pathname)) { console.error("seamshield enroll: the link is not a SeamShield enrollment link"); return 2; }
+  if (!/^(?:\/api)?\/e\/ssenroll_[a-zA-Z0-9_-]+$/.test(parsedLink.pathname)) { console.error("seamshield enroll: the link is not a SeamShield enrollment link"); return 2; }
   const apiUrl = (options.apiUrl || `${parsedLink.origin}/api`).replace(/\/$/, "");
   let local = readLocalEnrollment(target, link);
   if (!local) {
