@@ -810,6 +810,38 @@ describe("seamshield scan (built CLI)", () => {
     expect(source).not.toContain("set SEAMSHIELD_API_URL or pass --api-url for connected mode");
   });
 
+  it("does not report durable enrollment success until Platform persists the connection receipt", async () => {
+    const project = tempProject();
+    const digest = "a".repeat(64);
+    const server = createServer((req, res) => {
+      const path = new URL(req.url || "/", "http://127.0.0.1").pathname;
+      const body = (payload: unknown, status = 200) => {
+        res.writeHead(status, { "content-type": "application/json" });
+        res.end(JSON.stringify(payload));
+      };
+      if (req.method === "GET" && path === "/api/e/ssenroll_test") return body({ enrollment: { code: "ssenroll_test", id: "enroll_test", claimed: false } });
+      if (req.method === "POST" && path === "/api/v1/enrollment/ssenroll_test/claim") return body({ enrollment: { id: "enroll_test" }, agent_credential: { token: "ssenroll_test_agent" } }, 201);
+      if (req.method === "POST" && path === "/api/v1/enrollment/enroll_test/steps/connect_repository") {
+        return body({ connection: { digest, project: { id: "project_test", name: "Test project" } }, connection_credential: { server_key: "sssk_test" }, scan_receipt: { digest, created_at: "2026-08-07T00:00:00.000Z" }, dependency_receipt: { digest } }, 201);
+      }
+      // Simulate the exact split-brain failure: claim and connect response
+      // returned, but the durable checklist still lacks the receipt.
+      if (req.method === "GET" && path === "/api/v1/enrollment/enroll_test") return body({ enrollment: { steps: [{ id: "connect_repository", receipt_digest: null }] } });
+      return body({ error: "not_found" }, 404);
+    });
+    await new Promise<void>((resolveListen) => server.listen(0, "127.0.0.1", () => resolveListen()));
+    const address = server.address();
+    const port = typeof address === "object" && address ? address.port : 0;
+    try {
+      const result = await runCliEnvAsync(["enroll", `http://127.0.0.1:${port}/api/e/ssenroll_test`, project, "--offline"]);
+      expect(result.status).toBe(1);
+      expect(result.stdout).not.toContain("Enrollment checklist: repository connected");
+      expect(result.stderr).toContain("no durable connection receipt");
+    } finally {
+      await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
+    }
+  }, 20_000);
+
   it("exposes a source-private Sentinel server collector command", () => {
     const help = runCli(["sentinel", "observe", "--help"]);
     expect(help.status).toBe(0);

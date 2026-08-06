@@ -3637,6 +3637,22 @@ async function enrollProject(target: string, link: string, options: { apiUrl?: s
   }
   const result = await runConnectCommand("enroll", target, { apiUrl: local.api_url, offline: options.offline, enrollmentId: local.enrollment_id, enrollmentToken: local.agent_token, ci: false });
   if (result !== 0) return result;
+  // A successful local scanner exit is not enough to call enrollment complete:
+  // the Console only advances when its durable receipt exists. Confirm that
+  // receipt with the scoped agent credential before reporting success.
+  try {
+    const statusResponse = await fetch(`${local.api_url}/v1/enrollment/${encodeURIComponent(local.enrollment_id)}`, { headers: { accept: "application/json", authorization: `Bearer ${local.agent_token}` } });
+    const status = await statusResponse.json().catch(() => ({})) as { error?: string; enrollment?: { steps?: Array<{ id?: string; receipt_digest?: string | null }> } };
+    const receipt = status.enrollment?.steps?.find((step) => step.id === "connect_repository")?.receipt_digest;
+    if (!statusResponse.ok || !receipt) {
+      console.error(`seamshield enroll: repository connection was not confirmed by Platform (${status.error || statusResponse.status}). The link is claimed but has no durable connection receipt; rerun this same command from this repository.`);
+      return 1;
+    }
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    console.error(`seamshield enroll: repository connection could not be confirmed by Platform (${detail}). The link is claimed; rerun this same command from this repository when Platform is reachable.`);
+    return 1;
+  }
   console.log("Enrollment checklist: repository connected. Ask the customer before installing protected CI.");
   if (!options.requestCiApproval) return result;
   const approvalResponse = await fetch(`${local.api_url}/v1/enrollment/${encodeURIComponent(local.enrollment_id)}/approvals`, { method: "POST", headers: { "content-type": "application/json", accept: "application/json", authorization: `Bearer ${local.agent_token}` }, body: JSON.stringify({ step_id: "install_ci", title: "Install protected CI", detail: "Allow SeamShield to write the provider-native Build and Guard workflow. No source or secrets are uploaded." }) });
