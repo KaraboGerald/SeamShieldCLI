@@ -3,6 +3,17 @@ name: Release Community CLI
 on:
   push:
     tags: ["cli-v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Exact packages/cli package version to release"
+        required: true
+        type: string
+      publish:
+        description: "Publish to npm through trusted publishing (false runs verification only)"
+        required: true
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -26,8 +37,13 @@ jobs:
       - name: Verify release tag
         run: |
           version="$(node -p "require('./packages/cli/package.json').version")"
-          test "${GITHUB_REF_NAME#cli-v}" = "$version"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            test "${{ inputs.version }}" = "$version"
+          else
+            test "${GITHUB_REF_NAME#cli-v}" = "$version"
+          fi
       - run: pnpm release:verify
       - name: Publish with npm Trusted Publishing
+        if: github.event_name == 'push' || inputs.publish == true
         working-directory: packages/cli
         run: npm publish --access public

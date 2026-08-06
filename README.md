@@ -29,7 +29,7 @@ pnpm test
 
 ## Releases
 
-Trusted publishing runs from `.github/workflows/release-cli.yml` on tags named `cli-v<package-version>`. Configure npm's trusted publisher for this repository and workflow before creating a release tag.
+Trusted publishing runs from `.github/workflows/release-cli.yml` on tags named `cli-v<package-version>`. The same workflow also supports a manual GitHub Actions dispatch: it verifies by default and publishes only when `publish=true` and the supplied version matches `packages/cli/package.json`. Configure npm's trusted publisher for this repository and workflow before creating a release tag or dispatching a publish.
 
 ## Security boundary
 
