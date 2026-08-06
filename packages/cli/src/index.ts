@@ -1052,6 +1052,16 @@ type LocalConnection = {
   ci?: { provider: CiProvider; repository?: string; status: "configured" | "authorization_required" | "unsupported"; reason?: string };
 };
 
+type LocalEnrollment = {
+  schema: "seamshield.local-enrollment/v1";
+  link: string;
+  enrollment_id: string;
+  agent_token: string;
+  api_url: string;
+  claimed_at: string;
+  source_upload: false;
+};
+
 function connectedApiUrl(explicit: unknown, stored: LocalConnection | null): string {
   const selected = String(explicit || "").trim();
   if (selected) return selected.replace(/\/$/, "");
@@ -1059,6 +1069,7 @@ function connectedApiUrl(explicit: unknown, stored: LocalConnection | null): str
 }
 
 function connectionPath(target: string): string { return join(target, ".seamshield", "connection.json"); }
+function enrollmentPath(target: string): string { return join(target, ".seamshield", "enrollment.json"); }
 
 function readLocalConnection(target: string): LocalConnection | null {
   const path = connectionPath(target);
@@ -1069,9 +1080,26 @@ function readLocalConnection(target: string): LocalConnection | null {
   } catch { return null; }
 }
 
+function readLocalEnrollment(target: string, link: string): LocalEnrollment | null {
+  const path = enrollmentPath(target);
+  if (!existsSync(path)) return null;
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf8"));
+    return parsed?.schema === "seamshield.local-enrollment/v1" && parsed.link === link ? parsed as LocalEnrollment : null;
+  } catch { return null; }
+}
+
+function writeLocalEnrollment(target: string, enrollment: LocalEnrollment): void {
+  mkdirSync(join(target, ".seamshield"), { recursive: true });
+  const path = enrollmentPath(target);
+  writeFileSync(path, `${JSON.stringify(enrollment, null, 2)}\n`, { mode: 0o600 });
+  chmodSync(path, 0o600);
+  ignoreLocalConnection(target);
+}
+
 function ignoreLocalConnection(target: string): void {
   const path = join(target, ".gitignore");
-  const entries = [".seamshield/connection.json", ".seamshield/sentinel.json"];
+  const entries = [".seamshield/connection.json", ".seamshield/enrollment.json", ".seamshield/sentinel.json"];
   const current = existsSync(path) ? readFileSync(path, "utf8") : "";
   const existing = new Set(current.split(/\r?\n/));
   const missing = entries.filter((entry) => !existing.has(entry));
@@ -1968,7 +1996,7 @@ async function verifyDeploymentGate(options: { projectId?: string; commit?: stri
 // Network failures inside connect/sync previously escaped as unhandled
 // rejections (DNS refusal, TLS error, non-JSON 2xx). Classify them here so the
 // user always gets a cause and a next action instead of a stack trace.
-async function runConnectCommand(label: "connect" | "sync", target: string, options: Parameters<typeof connectProject>[1]): Promise<number> {
+async function runConnectCommand(label: "connect" | "sync" | "enroll", target: string, options: Parameters<typeof connectProject>[1]): Promise<number> {
   try {
     return await connectProject(target, { ...options, label });
   } catch (error) {
@@ -1987,14 +2015,14 @@ async function runConnectCommand(label: "connect" | "sync", target: string, opti
   }
 }
 
-async function connectProject(target: string, options: { projectId?: string; token?: string; apiUrl?: string; offline?: boolean; ci?: boolean; ciProvider?: string; ciRepositoryId?: string; ciIssuer?: string; ciJwksUri?: string; ciAudience?: string; label?: "connect" | "sync" }): Promise<number> {
+async function connectProject(target: string, options: { projectId?: string; token?: string; enrollmentId?: string; enrollmentToken?: string; apiUrl?: string; offline?: boolean; ci?: boolean; ciProvider?: string; ciRepositoryId?: string; ciIssuer?: string; ciJwksUri?: string; ciAudience?: string; label?: "connect" | "sync" | "enroll" }): Promise<number> {
   const startedAt = Date.now();
   const stored = readLocalConnection(target);
   const projectId = options.projectId || process.env.SEAMSHIELD_PROJECT_ID || stored?.project.id || "";
   const serverKey = process.env.SEAMSHIELD_SERVER_KEY || stored?.server_key || "";
   const connectionToken = options.token || "";
   const apiUrl = connectedApiUrl(options.apiUrl || process.env.SEAMSHIELD_API_URL, stored);
-  if (!connectionToken && (!projectId || (!serverKey && !options.ci))) {
+  if (!connectionToken && !(options.enrollmentId && options.enrollmentToken) && (!projectId || (!serverKey && !options.ci))) {
     // This used to say "run the one-time Platform connection command first"
     // under the hardcoded `connect` label, even when invoked as `sync` from a
     // release gate. In CI there is no interactive connect step and no local
@@ -2050,14 +2078,15 @@ async function connectProject(target: string, options: { projectId?: string; tok
     fix_summary: lane.fix.summary,
     source_title: lane.source.title,
   }));
-  if (connectionToken) {
-    const response = await fetch(`${apiUrl}/v1/projects/connections/redeem`, { method: "POST", headers: { "content-type": "application/json", accept: "application/json" }, body: JSON.stringify({ token: connectionToken, path_label: pathLabel, ci_binding: ciPlan?.binding, scan: { idempotency_key: idempotencyKey, profile: "community", counts, lanes: projectLanes }, inventory: { components: inventory.components.map((component: InventoryComponent) => ({ ecosystem: component.ecosystem, name: component.name, version: component.version })) } }) });
+  if (connectionToken || (options.enrollmentId && options.enrollmentToken)) {
+    const enrolled = Boolean(options.enrollmentId && options.enrollmentToken);
+    const response = await fetch(enrolled ? `${apiUrl}/v1/enrollment/${encodeURIComponent(options.enrollmentId || "")}/steps/connect_repository` : `${apiUrl}/v1/projects/connections/redeem`, { method: "POST", headers: { "content-type": "application/json", accept: "application/json", ...(enrolled ? { authorization: `Bearer ${options.enrollmentToken}` } : {}) }, body: JSON.stringify({ ...(enrolled ? {} : { token: connectionToken }), path_label: pathLabel, ci_binding: ciPlan?.binding, scan: { idempotency_key: idempotencyKey, profile: "community", counts, lanes: projectLanes }, inventory: { components: inventory.components.map((component: InventoryComponent) => ({ ecosystem: component.ecosystem, name: component.name, version: component.version })) } }) });
     const body = await response.json().catch(() => ({})) as { error?: string; connection?: { digest?: string; project?: { id?: string; name?: string; primary_domain?: string } }; connection_credential?: { server_key?: string }; scan_receipt?: { digest?: string; created_at?: string }; dependency_receipt?: { digest?: string } };
     if (!response.ok) {
       const next = body.error === "connection_token_invalid_or_expired"
         ? "Generate a fresh connection command in Build → Platform, or run `seamshield sync .` to refresh the existing connection."
         : "The local connection was left unchanged.";
-      console.error(`seamshield connect: ${String(body.error || `connection token rejected (${response.status})`)}. ${next}`);
+      console.error(`seamshield ${options.label || "connect"}: ${String(body.error || `connection token rejected (${response.status})`)}. ${next}`);
       return 1;
     }
     let connectionDigest = "";
@@ -2073,7 +2102,7 @@ async function connectProject(target: string, options: { projectId?: string; tok
     }
     if (!body.connection?.project?.id || !body.connection_credential?.server_key) { console.error("seamshield connect: backend did not return a reusable project credential"); return 1; }
     if (stored) console.log(`Replacing existing local enrollment for ${stored.project.name || stored.project.id} after receipt verification.`);
-    console.log(`Connected ${pathLabel} via one-time project token`);
+    console.log(`Connected ${pathLabel} via ${enrolled ? "durable agent enrollment" : "one-time project token"}`);
     console.log(`Project: ${body.connection?.project?.name || body.connection?.project?.id || "connected project"}${body.connection?.project?.primary_domain ? ` · ${body.connection.project.primary_domain}` : ""}`);
     console.log(`Connection receipt: ${connectionDigest.slice(0, 18)}`);
     console.log(`Scan receipt: ${scanDigest.slice(0, 18)}`);
@@ -3587,6 +3616,50 @@ program
   .option("--offline", "skip network-backed dependency intelligence")
   .action(async (path: string, opts: { projectId?: string; token?: string; apiUrl?: string; offline?: boolean; ciProvider?: string; ciRepositoryId?: string; ciIssuer?: string; ciJwksUri?: string; ciAudience?: string }) => {
     process.exitCode = await runConnectCommand("connect", resolve(path), opts);
+  });
+
+async function enrollProject(target: string, link: string, options: { apiUrl?: string; offline?: boolean; agentLabel?: string; requestCiApproval?: boolean }): Promise<number> {
+  let parsedLink: URL;
+  try { parsedLink = new URL(link); } catch { console.error("seamshield enroll: expected an enrollment link such as https://platform.seamshield.com/e/ssenroll_..."); return 2; }
+  if (!/^\/e\/ssenroll_[a-zA-Z0-9_-]+$/.test(parsedLink.pathname)) { console.error("seamshield enroll: the link is not a SeamShield enrollment link"); return 2; }
+  const apiUrl = (options.apiUrl || `${parsedLink.origin}/api`).replace(/\/$/, "");
+  let local = readLocalEnrollment(target, link);
+  if (!local) {
+    const planResponse = await fetch(link, { headers: { accept: "application/json" } });
+    const plan = await planResponse.json().catch(() => ({})) as { enrollment?: { code?: string; id?: string; claimed?: boolean }; error?: string };
+    if (!planResponse.ok || !plan.enrollment?.code || !plan.enrollment?.id) { console.error(`seamshield enroll: ${plan.error || "enrollment link could not be read"}`); return 1; }
+    if (plan.enrollment.claimed) { console.error("seamshield enroll: this link is already claimed by another agent. Resume from the original repository, or generate a new link in Console."); return 1; }
+    const claimedResponse = await fetch(`${apiUrl}/v1/enrollment/${encodeURIComponent(plan.enrollment.code)}/claim`, { method: "POST", headers: { "content-type": "application/json", accept: "application/json" }, body: JSON.stringify({ agent_label: options.agentLabel || "local CLI agent" }) });
+    const claimed = await claimedResponse.json().catch(() => ({})) as { enrollment?: { id?: string }; agent_credential?: { token?: string }; error?: string };
+    if (!claimedResponse.ok || !claimed.enrollment?.id || !claimed.agent_credential?.token) { console.error(`seamshield enroll: ${claimed.error || "enrollment claim rejected"}`); return 1; }
+    local = { schema: "seamshield.local-enrollment/v1", link, enrollment_id: claimed.enrollment.id, agent_token: claimed.agent_credential.token, api_url: apiUrl, claimed_at: new Date().toISOString(), source_upload: false };
+    writeLocalEnrollment(target, local);
+  }
+  const result = await runConnectCommand("enroll", target, { apiUrl: local.api_url, offline: options.offline, enrollmentId: local.enrollment_id, enrollmentToken: local.agent_token, ci: false });
+  if (result !== 0) return result;
+  console.log("Enrollment checklist: repository connected. Ask the customer before installing protected CI.");
+  if (!options.requestCiApproval) return result;
+  const approvalResponse = await fetch(`${local.api_url}/v1/enrollment/${encodeURIComponent(local.enrollment_id)}/approvals`, { method: "POST", headers: { "content-type": "application/json", accept: "application/json", authorization: `Bearer ${local.agent_token}` }, body: JSON.stringify({ step_id: "install_ci", title: "Install protected CI", detail: "Allow SeamShield to write the provider-native Build and Guard workflow. No source or secrets are uploaded." }) });
+  const approval = await approvalResponse.json().catch(() => ({})) as { error?: string; approval?: { id?: string } };
+  if (!approvalResponse.ok) { console.error(`seamshield enroll: CI approval request failed: ${approval.error || approvalResponse.status}`); return 1; }
+  console.log(`CI approval requested: ${approval.approval?.id || "recorded"}. Continue after the customer approves it in Console.`);
+  return result;
+}
+
+program
+  .command("enroll")
+  .description("Claim a durable SeamShield enrollment link and connect this repository without exposing a one-time token")
+  .argument("<link>", "enrollment link copied from the customer Console")
+  .argument("[path]", "directory to scan", ".")
+  .option("--api-url <url>", "SeamShield backend base URL (normally inferred from the enrollment link)")
+  .option("--agent-label <label>", "label shown in the Console approval checklist")
+  .option("--offline", "skip network-backed dependency intelligence")
+  .option("--request-ci-approval", "request customer approval to install the protected CI workflow after connecting")
+  .action(async (link: string, path: string, opts: { apiUrl?: string; agentLabel?: string; offline?: boolean; requestCiApproval?: boolean }) => {
+    const target = resolve(path);
+    if (!existsSync(target)) { console.error(`seamshield: path not found: ${path}`); process.exitCode = 2; return; }
+    try { process.exitCode = await enrollProject(target, link, opts); }
+    catch (error) { console.error(`seamshield enroll: ${error instanceof Error ? error.message : String(error)}`); process.exitCode = 1; }
   });
 
 program
