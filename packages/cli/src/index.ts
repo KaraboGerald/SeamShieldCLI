@@ -1982,10 +1982,19 @@ async function verifyDeploymentGate(options: { projectId?: string; commit?: stri
     || "";
   if (branch) url.searchParams.set("branch", branch);
   const response = await fetch(url, { headers: { "x-seamshield-server-key": serverKey, accept: "application/json" } });
-  const body = await response.json().catch(() => ({})) as { error?: string; deployment_gate?: { allowed?: boolean; reason?: string; release_receipt_digest?: string | null; receipt_created_at?: string | null } };
+  const body = await response.json().catch(() => ({})) as { error?: string; detail?: string; deployment_gate?: { allowed?: boolean; reason?: string; release_receipt_digest?: string | null; receipt_created_at?: string | null } };
   const gate = body.deployment_gate;
   if (!response.ok || !gate?.allowed) {
-    throw new Error(`deployment gate denied: ${gate?.reason || body.error || `verification failed (${response.status})`}`);
+    const recovery = body.error === "deployment_gate_server_key_missing"
+      ? "Set this project's SEAMSHIELD_SERVER_KEY (or SEAMSHIELD_RUNTIME_SERVER_KEY) in the deployment host secret store."
+      : body.error === "deployment_gate_server_key_invalid"
+        ? "The host key is not active. Reveal or rotate the runtime server key for this exact project, then update the host secret store."
+        : body.error === "deployment_gate_credential_project_mismatch"
+          ? "The host is using another service's key. Pair this project's ID with its own runtime server key; do not reuse the admin project's key for the web deployment."
+          : body.error === "automation_credential_required"
+            ? "Use this project's runtime server key on the deployment host, or run the gate from the bound CI provider OIDC workflow."
+            : "";
+    throw new Error(`deployment gate denied: ${gate?.reason || body.error || `verification failed (${response.status})`}${recovery ? ` · ${recovery}` : body.detail ? ` · ${body.detail}` : ""}`);
   }
   console.log(`Deployment gate passed · ${projectId} · ${commitDigest.slice(0, 12)}`);
   console.log(`Release receipt: ${(gate.release_receipt_digest || "").slice(0, 18)}`);

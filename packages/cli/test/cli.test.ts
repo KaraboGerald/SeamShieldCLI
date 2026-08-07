@@ -953,6 +953,28 @@ describe("seamshield scan (built CLI)", () => {
     }
   }, 20_000);
 
+  it("explains when a deployment host combines one project's id with another project's key", async () => {
+    const server = createServer((_req, res) => {
+      res.writeHead(403, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "deployment_gate_credential_project_mismatch" }));
+    });
+    await new Promise<void>((ready) => server.listen(0, "127.0.0.1", ready));
+    const apiUrl = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+    try {
+      const result = await runCliEnvAsync(["deploy-gate", "verify", "--project-id", "project_web", "--api-url", apiUrl], {
+        SEAMSHIELD_RUNTIME_SERVER_KEY: "sssk_other_project",
+        SEAMSHIELD_DEPLOY_COMMIT: "1111111111111111111111111111111111111111",
+        SEAMSHIELD_DEPLOY_BRANCH: "main",
+      });
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("another service's key");
+      expect(result.stderr).toContain("admin project's key");
+      expect(result.stderr).not.toContain("sssk_other_project");
+    } finally {
+      await new Promise<void>((closed) => server.close(() => closed()));
+    }
+  }, 20_000);
+
   it("reports onboarding stage state and the exact next command", () => {
     // Onboarding spans six surfaces. `setup` must answer "what do I run next"
     // without the user stitching together four other status commands.
