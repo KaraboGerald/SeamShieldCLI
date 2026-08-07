@@ -784,6 +784,8 @@ describe("seamshield scan (built CLI)", () => {
     expect(source).toContain("BITBUCKET_STEP_OIDC_TOKEN");
     expect(source).toContain("CIRCLE_OIDC_TOKEN_V2");
     expect(source).toContain("ci/exchange");
+    expect(source).toContain("process.env.SEAMSHIELD_DEPLOY_BRANCH || process.env.GITHUB_REF_NAME");
+    expect(source).toContain("process.env.SEAMSHIELD_DEPLOY_COMMIT || process.env.GITHUB_SHA");
     expect(source).toContain("branch_protection_present");
     expect(source).toContain("workflow_present");
     expect(source).toContain("duration_ms: Date.now() - startedAt");

@@ -2148,8 +2148,12 @@ async function connectProject(target: string, options: { projectId?: string; tok
   const inventoryResponse = await fetch(`${apiUrl}/v1/projects/${encodeURIComponent(projectId)}/dependencies/receipts`, { method: "POST", headers, body: JSON.stringify({ idempotency_key: idempotencyKey, components: inventory.components.map((component: InventoryComponent) => ({ ecosystem: component.ecosystem, name: component.name, version: component.version })) }) });
   if (!inventoryResponse.ok) { console.error(`seamshield connect: dependency inventory rejected (${inventoryResponse.status})`); return 1; }
   const verdict = buildShipVerdict(result);
-  const branch = process.env.GITHUB_REF_NAME || process.env.CI_COMMIT_REF_NAME || process.env.BITBUCKET_BRANCH || process.env.BUILD_SOURCEBRANCHNAME || process.env.CIRCLE_BRANCH || "main";
-  const commitDigest = process.env.GITHUB_SHA || process.env.CI_COMMIT_SHA || process.env.BITBUCKET_COMMIT || process.env.BUILD_SOURCEVERSION || process.env.CIRCLE_SHA1;
+  // Direct deployment hosts (Coolify, DevPush) provide their immutable commit
+  // independently of a CI provider. Honor those explicit values first so a
+  // local `sync` records the same release identity that `deploy-gate verify`
+  // will later enforce.
+  const branch = process.env.SEAMSHIELD_DEPLOY_BRANCH || process.env.GITHUB_REF_NAME || process.env.CI_COMMIT_REF_NAME || process.env.BITBUCKET_BRANCH || process.env.BUILD_SOURCEBRANCHNAME || process.env.CIRCLE_BRANCH || "main";
+  const commitDigest = process.env.SEAMSHIELD_DEPLOY_COMMIT || process.env.GITHUB_SHA || process.env.CI_COMMIT_SHA || process.env.BITBUCKET_COMMIT || process.env.BUILD_SOURCEVERSION || process.env.CIRCLE_SHA1;
   const blockedLaneIds = projectLanes.filter((lane) => lane.severity === "critical").map((lane) => lane.lane_id);
   // The receipt carried no environment, so the deployment gate could not tell
   // which environment a passing run authorized and a staging receipt released

@@ -1,6 +1,6 @@
 {
   "name": "@seamshield/cli",
-  "version": "0.3.32",
+  "version": "0.3.33",
   "description": "Community source-private repository scanner and local control engine for AI-built projects",
   "type": "module",
   "license": "MIT",
